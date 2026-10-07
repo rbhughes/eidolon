@@ -6,12 +6,24 @@ from datetime import datetime
 from pathlib import Path
 
 import typer
+from dotenv import load_dotenv
 
 from spiritbox import doctor, runtime
+
+load_dotenv(runtime.PROJECT_ROOT / ".env")
 
 app = typer.Typer(help="A ghost-box style RTL-SDR CLI with speech-to-text.")
 
 RECORDINGS_DIR = runtime.PROJECT_ROOT / "recordings"
+
+
+def _parse_freq(value: str) -> float:
+    value = value.strip().upper()
+    if value.endswith("M"):
+        return float(value[:-1]) * 1e6
+    if value.endswith("K"):
+        return float(value[:-1]) * 1e3
+    return float(value)
 
 
 @app.command()
@@ -63,6 +75,40 @@ def record(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
     typer.echo(f"recorded {seconds}s at {freq} -> {path}")
+
+
+@app.command()
+def sweep(
+    chunk_seconds: float = typer.Option(3.0, "--chunk-seconds", "-c", help="Seconds of audio per hop"),
+    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range"),
+    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range"),
+    duration: float = typer.Option(None, "--duration", "-d", help="Total seconds to run; omit to run until Ctrl+C"),
+    volume: int = typer.Option(runtime.DEFAULT_VOLUME, "--volume", "-v", help="Linear playback volume"),
+) -> None:
+    """Hop randomly across a frequency band, transcribing each chunk near-real-time."""
+    band = (_parse_freq(band_low), _parse_freq(band_high))
+
+    def on_chunk(freq: str, index: int) -> None:
+        typer.echo(f"[{index}] tuning {freq}...")
+
+    def on_transcript(freq: str, index: int, text: str) -> None:
+        typer.echo(f"[{index}] {freq}: {text!r}")
+
+    typer.echo("sweeping -- press Ctrl+C to stop")
+    try:
+        runtime.sweep(
+            chunk_seconds=chunk_seconds,
+            band=band,
+            volume=volume,
+            total_seconds=duration,
+            on_chunk=on_chunk,
+            on_transcript=on_transcript,
+        )
+    except RuntimeError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    except KeyboardInterrupt:
+        typer.echo("\nstopped")
 
 
 def main() -> None:
