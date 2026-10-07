@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+
+# Per-session notes on how effectively prompts/context were given to Claude.
+# Not meant for the repo history -- kept local only.
+/.claude-feedback/
