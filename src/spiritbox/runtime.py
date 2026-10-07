@@ -24,6 +24,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATE_DIR = PROJECT_ROOT / ".run"
 STATE_FILE = STATE_DIR / "session.json"
+HOTSPOTS_FILE = STATE_DIR / "hotspots.json"
 
 DEFAULT_FREQ = "100.0M"
 DEFAULT_VOLUME = 65536  # PulseAudio/PipeWire "normal" (unity) volume
@@ -31,9 +32,88 @@ RF_SAMPLE_RATE_ARG = "200k"
 AUDIO_RATE_ARG = "48k"
 AUDIO_RATE_HZ = 48000
 
+# US FM broadcast channels sit every 200kHz starting at 88.1 MHz (odd tenths
+# only) -- hopping off this grid guarantees landing between stations.
+FM_CHANNEL_SPACING_HZ = 200_000
+FM_CHANNEL_BASE_HZ = 88_100_000
+
 
 def _rtl_fm_cmd(freq: str) -> list[str]:
     return ["rtl_fm", "-f", freq, "-M", "fm", "-s", RF_SAMPLE_RATE_ARG, "-r", AUDIO_RATE_ARG, "-"]
+
+
+def _random_valid_channel(band: tuple[float, float]) -> float:
+    """A random frequency on the real FM channel grid within band."""
+    low, high = int(band[0]), int(band[1])
+    first = FM_CHANNEL_BASE_HZ + FM_CHANNEL_SPACING_HZ * max(
+        0, -(-(low - FM_CHANNEL_BASE_HZ) // FM_CHANNEL_SPACING_HZ)
+    )
+    n_channels = max(1, int((high - first) // FM_CHANNEL_SPACING_HZ) + 1)
+    return float(first + random.randrange(n_channels) * FM_CHANNEL_SPACING_HZ)
+
+
+def scan(
+    band: tuple[float, float] = (88.0e6, 108.0e6),
+    resolution_hz: float = 50_000,
+    integration_seconds: int = 20,
+    min_db_above_median: float = 6.0,
+    top_n: int = 20,
+) -> list[dict]:
+    """Sweep `band` with rtl_power and save the strongest peaks as hotspots
+    for sweep() to bias hops towards. Returns the peaks found."""
+    import csv
+    import tempfile
+
+    low, high = band
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+        csv_path = Path(tmp.name)
+    try:
+        subprocess.run(
+            ["rtl_power", "-f", f"{int(low)}:{int(high)}:{int(resolution_hz)}", "-i", str(integration_seconds), "-1", str(csv_path)],
+            capture_output=True,
+            timeout=integration_seconds + 60,
+        )
+        rows: list[tuple[float, float]] = []
+        with open(csv_path) as f:
+            for line in f:
+                parts = [p.strip() for p in line.strip().split(",")]
+                if len(parts) < 7:
+                    continue
+                hz_low, hz_step = float(parts[2]), float(parts[4])
+                for i, db_str in enumerate(parts[6:]):
+                    rows.append((hz_low + i * hz_step, float(db_str)))
+    finally:
+        csv_path.unlink(missing_ok=True)
+
+    if not rows:
+        return []
+
+    median_db = sorted(db for _, db in rows)[len(rows) // 2]
+    threshold = median_db + min_db_above_median
+
+    rows.sort(key=lambda r: -r[1])
+    peaks: list[dict] = []
+    for freq, db in rows:
+        if db < threshold:
+            break
+        if any(abs(freq - p["freq_hz"]) < FM_CHANNEL_SPACING_HZ for p in peaks):
+            continue
+        peaks.append({"freq_hz": freq, "db": db})
+        if len(peaks) >= top_n:
+            break
+
+    STATE_DIR.mkdir(exist_ok=True)
+    HOTSPOTS_FILE.write_text(json.dumps(peaks))
+    return peaks
+
+
+def load_hotspots() -> list[dict]:
+    if not HOTSPOTS_FILE.exists():
+        return []
+    try:
+        return json.loads(HOTSPOTS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
 
 
 def _pcm_to_wav_bytes(pcm: bytes, rate: int = AUDIO_RATE_HZ) -> bytes:
@@ -176,22 +256,28 @@ def record(path: Path, seconds: float, freq: str = DEFAULT_FREQ) -> Path:
 def sweep(
     chunk_seconds: float = 3.0,
     band: tuple[float, float] = (88.0e6, 108.0e6),
-    step_hz: float = 0.1e6,
+    hotspot_bias: float = 0.6,
     volume: int = DEFAULT_VOLUME,
     total_seconds: float | None = None,
     on_chunk: Callable[[str, int], None] | None = None,
     on_transcript: Callable[[str, int, str], None] | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
-    """Hop randomly across `band`, playing each chunk live and transcribing it
-    in the background so the next hop doesn't wait on the API response."""
+    """Hop across `band`, playing each chunk live and transcribing it in the
+    background so the next hop doesn't wait on the API response.
+
+    Hops land on real FM channels (the 200kHz US broadcast grid), not
+    arbitrary frequencies. If hotspots have been found via scan(), a
+    hotspot_bias fraction of hops land on one of them (actual stations);
+    the rest are fully random valid channels (static/other signals).
+    """
     if is_running() is not None:
         raise RuntimeError("live monitor is running -- run stop first")
 
     stop_event = stop_event or threading.Event()
     bytes_per_second = AUDIO_RATE_HZ * 2  # 16-bit mono
     chunk_bytes_target = int(bytes_per_second * chunk_seconds)
-    low, high = int(band[0]), int(band[1])
+    hotspots = load_hotspots() if hotspot_bias > 0 else []
 
     player = subprocess.Popen(
         [
@@ -227,7 +313,10 @@ def sweep(
                 if total_seconds is not None and time.time() - start_time >= total_seconds:
                     break
 
-                freq_hz = random.randrange(low, high, int(step_hz))
+                if hotspots and random.random() < hotspot_bias:
+                    freq_hz = random.choice(hotspots)["freq_hz"]
+                else:
+                    freq_hz = _random_valid_channel(band)
                 freq = f"{freq_hz / 1e6:.1f}M"
                 if on_chunk is not None:
                     on_chunk(freq, index)

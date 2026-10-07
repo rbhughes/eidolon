@@ -78,14 +78,38 @@ def record(
 
 
 @app.command()
+def scan(
+    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the scan range"),
+    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the scan range"),
+) -> None:
+    """Scan a band for active stations and save them as sweep hotspots."""
+    typer.echo("scanning (takes ~20s)...")
+    band = (_parse_freq(band_low), _parse_freq(band_high))
+    peaks = runtime.scan(band=band)
+    if not peaks:
+        typer.echo("no clear peaks found")
+        return
+    for p in peaks:
+        typer.echo(f"{p['freq_hz'] / 1e6:7.2f} MHz  {p['db']:6.2f} dB")
+    typer.echo(f"saved {len(peaks)} hotspots -> {runtime.HOTSPOTS_FILE}")
+
+
+@app.command()
 def sweep(
     chunk_seconds: float = typer.Option(3.0, "--chunk-seconds", "-c", help="Seconds of audio per hop"),
     band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range"),
     band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range"),
     duration: float = typer.Option(None, "--duration", "-d", help="Total seconds to run; omit to run until Ctrl+C"),
     volume: int = typer.Option(runtime.DEFAULT_VOLUME, "--volume", "-v", help="Linear playback volume"),
+    hotspot_bias: float = typer.Option(
+        0.6, "--hotspot-bias", help="Fraction of hops biased toward scan()-found stations (0 = fully random valid channels)"
+    ),
 ) -> None:
-    """Hop randomly across a frequency band, transcribing each chunk near-real-time."""
+    """Hop across a frequency band, transcribing each chunk near-real-time.
+
+    Run 'spiritbox scan' first to bias hops toward actual local stations;
+    without it, hops are random across the real FM channel grid.
+    """
     band = (_parse_freq(band_low), _parse_freq(band_high))
 
     def on_chunk(freq: str, index: int) -> None:
@@ -94,11 +118,14 @@ def sweep(
     def on_transcript(freq: str, index: int, text: str) -> None:
         typer.echo(f"[{index}] {freq}: {text!r}")
 
+    if not runtime.load_hotspots():
+        typer.echo("no saved hotspots -- run 'spiritbox scan' first for better odds of real text")
     typer.echo("sweeping -- press Ctrl+C to stop")
     try:
         runtime.sweep(
             chunk_seconds=chunk_seconds,
             band=band,
+            hotspot_bias=hotspot_bias,
             volume=volume,
             total_seconds=duration,
             on_chunk=on_chunk,
