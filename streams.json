@@ -1,5 +1,5 @@
 [
   {"name": "BBC World Service", "url": "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service"},
-  {"name": "KQED Public Radio", "url": "https://streams.kqed.org/kqedradio"},
+  {"name": "WBUR", "url": "https://icecast-stream.wbur.org/wbur.aac"},
   {"name": "WCPE Classical", "url": "https://audio-mp3.ibiblio.org/wcpe.mp3"}
 ]
