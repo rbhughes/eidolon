@@ -104,6 +104,16 @@ def sweep(
     hotspot_bias: float = typer.Option(
         0.6, "--hotspot-bias", help="Fraction of hops biased toward scan()-found stations (0 = fully random valid channels)"
     ),
+    gate: bool = typer.Option(
+        True, "--gate/--no-gate", help="Skip chunks that look like dead air/static before sending them for transcription"
+    ),
+    silence_dbfs: float = typer.Option(-50.0, "--silence-dbfs", help="Chunks quieter than this (dBFS) are treated as dead air"),
+    max_flatness: float = typer.Option(
+        0.45, "--max-flatness", help="Chunks with spectral flatness above this are treated as static (0=tonal, 1=flat noise)"
+    ),
+    debug_stats: bool = typer.Option(
+        False, "--debug-stats", "-D", help="Print the audio profile stats for every chunk, to help tune thresholds"
+    ),
 ) -> None:
     """Hop across a frequency band, transcribing each chunk near-real-time.
 
@@ -118,6 +128,16 @@ def sweep(
     def on_transcript(freq: str, index: int, text: str) -> None:
         typer.echo(f"[{index}] {freq}: {text!r}")
 
+    def on_profile(freq: str, index: int, stats: dict, passed: bool) -> None:
+        if debug_stats:
+            verdict = "pass" if passed else "skip"
+            typer.echo(
+                f"[{index}] {freq}: dbfs={stats['rms_dbfs']:6.1f} flatness={stats['flatness']:.2f} "
+                f"zcr={stats['zcr']:.2f} -> {verdict}"
+            )
+        elif gate and not passed:
+            typer.echo(f"[{index}] {freq}: skipped (dead air/static)")
+
     if not runtime.load_hotspots():
         typer.echo("no saved hotspots -- run 'spiritbox scan' first for better odds of real text")
     typer.echo("sweeping -- press Ctrl+C to stop")
@@ -128,8 +148,12 @@ def sweep(
             hotspot_bias=hotspot_bias,
             volume=volume,
             total_seconds=duration,
+            gate=gate,
+            silence_dbfs=silence_dbfs,
+            max_flatness=max_flatness,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
+            on_profile=on_profile,
         )
     except RuntimeError as exc:
         typer.echo(f"error: {exc}", err=True)

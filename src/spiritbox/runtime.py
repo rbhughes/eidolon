@@ -259,8 +259,12 @@ def sweep(
     hotspot_bias: float = 0.6,
     volume: int = DEFAULT_VOLUME,
     total_seconds: float | None = None,
+    gate: bool = True,
+    silence_dbfs: float = -50.0,
+    max_flatness: float = 0.45,
     on_chunk: Callable[[str, int], None] | None = None,
     on_transcript: Callable[[str, int, str], None] | None = None,
+    on_profile: Callable[[str, int, dict, bool], None] | None = None,
     stop_event: threading.Event | None = None,
 ) -> None:
     """Hop across `band`, playing each chunk live and transcribing it in the
@@ -270,6 +274,12 @@ def sweep(
     arbitrary frequencies. If hotspots have been found via scan(), a
     hotspot_bias fraction of hops land on one of them (actual stations);
     the rest are fully random valid channels (static/other signals).
+
+    When `gate` is True, each chunk is statistically profiled (see
+    audiocheck.py) before being sent for transcription -- dead air and
+    static are skipped without spending an API call. `on_profile`, if set,
+    is always called with the computed stats regardless of gate/pass-fail,
+    for calibration/debugging.
     """
     if is_running() is not None:
         raise RuntimeError("live monitor is running -- run stop first")
@@ -294,7 +304,7 @@ def sweep(
     )
     assert player.stdin is not None
 
-    from spiritbox import transcribe  # local import: keep OpenRouter optional for non-sweep commands
+    from spiritbox import audiocheck, transcribe  # local import: keep OpenRouter optional for non-sweep commands
 
     def _transcribe_and_report(wav_bytes: bytes, freq: str, index: int) -> None:
         if on_transcript is None:
@@ -341,7 +351,18 @@ def sweep(
                     except subprocess.TimeoutExpired:
                         proc.kill()
 
-                executor.submit(_transcribe_and_report, _pcm_to_wav_bytes(bytes(collected)), freq, index)
+                pcm_bytes = bytes(collected)
+                passed, _reason, stats = audiocheck.is_worth_transcribing(
+                    pcm_bytes, AUDIO_RATE_HZ, silence_dbfs=silence_dbfs, max_flatness=max_flatness
+                )
+                if on_profile is not None:
+                    on_profile(freq, index, stats, passed)
+
+                if gate and not passed:
+                    index += 1
+                    continue
+
+                executor.submit(_transcribe_and_report, _pcm_to_wav_bytes(pcm_bytes), freq, index)
                 index += 1
     finally:
         try:
