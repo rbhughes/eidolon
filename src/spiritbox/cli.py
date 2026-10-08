@@ -97,12 +97,17 @@ def scan(
 @app.command()
 def sweep(
     chunk_seconds: float = typer.Option(3.0, "--chunk-seconds", "-c", help="Seconds of audio per hop"),
-    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range"),
-    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range"),
+    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range (sdr source only)"),
+    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range (sdr source only)"),
     duration: float = typer.Option(None, "--duration", "-d", help="Total seconds to run; omit to run until Ctrl+C"),
     volume: int = typer.Option(runtime.DEFAULT_VOLUME, "--volume", "-v", help="Linear playback volume"),
+    source: str = typer.Option(
+        "sdr", "--source", help="Where chunks come from: 'sdr' (RTL-SDR dongle) or 'stream' (internet radio, see streams.json)"
+    ),
     hotspot_bias: float = typer.Option(
-        0.6, "--hotspot-bias", help="Fraction of hops biased toward scan()-found stations (0 = fully random valid channels)"
+        0.6,
+        "--hotspot-bias",
+        help="sdr source only: fraction of hops biased toward scan()-found stations (0 = fully random valid channels)",
     ),
     gate: bool = typer.Option(
         True, "--gate/--no-gate", help="Skip chunks that look like dead air/static before sending them for transcription"
@@ -115,31 +120,39 @@ def sweep(
         False, "--debug-stats", "-D", help="Print the audio profile stats for every chunk, to help tune thresholds"
     ),
 ) -> None:
-    """Hop across a frequency band, transcribing each chunk near-real-time.
+    """Hop across an audio source, transcribing each chunk near-real-time.
 
-    Run 'spiritbox scan' first to bias hops toward actual local stations;
-    without it, hops are random across the real FM channel grid.
+    source=sdr (default): hops across the RTL-SDR FM channel grid. Run
+    'spiritbox scan' first to bias hops toward actual local stations;
+    without it, hops are random across the grid.
+
+    source=stream: hops across the internet radio stations listed in
+    streams.json instead -- no dongle needed, and talk/news stations give
+    a higher speech hit rate than music-heavy FM. See 'spiritbox streams'.
     """
     band = (_parse_freq(band_low), _parse_freq(band_high))
 
-    def on_chunk(freq: str, index: int) -> None:
-        typer.echo(f"[{index}] tuning {freq}...")
+    def on_chunk(label: str, index: int) -> None:
+        typer.echo(f"[{index}] tuning {label}...")
 
-    def on_transcript(freq: str, index: int, text: str) -> None:
-        typer.echo(f"[{index}] {freq}: {text!r}")
+    def on_transcript(label: str, index: int, text: str) -> None:
+        typer.echo(f"[{index}] {label}: {text!r}")
 
-    def on_profile(freq: str, index: int, stats: dict, passed: bool) -> None:
+    def on_profile(label: str, index: int, stats: dict, passed: bool) -> None:
         if debug_stats:
             verdict = "pass" if passed else "skip"
             typer.echo(
-                f"[{index}] {freq}: dbfs={stats['rms_dbfs']:6.1f} flatness={stats['flatness']:.2f} "
+                f"[{index}] {label}: dbfs={stats['rms_dbfs']:6.1f} flatness={stats['flatness']:.2f} "
                 f"zcr={stats['zcr']:.2f} -> {verdict}"
             )
         elif gate and not passed:
-            typer.echo(f"[{index}] {freq}: skipped (dead air/static)")
+            typer.echo(f"[{index}] {label}: skipped (dead air/static)")
 
-    if not runtime.load_hotspots():
+    if source == "sdr" and not runtime.load_hotspots():
         typer.echo("no saved hotspots -- run 'spiritbox scan' first for better odds of real text")
+    if source == "stream" and not runtime.load_streams():
+        typer.echo(f"error: no stations configured -- add some to {runtime.STREAMS_FILE}", err=True)
+        raise typer.Exit(1)
     typer.echo("sweeping -- press Ctrl+C to stop")
     try:
         runtime.sweep(
@@ -151,15 +164,27 @@ def sweep(
             gate=gate,
             silence_dbfs=silence_dbfs,
             max_flatness=max_flatness,
+            source=source,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
             on_profile=on_profile,
         )
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
     except KeyboardInterrupt:
         typer.echo("\nstopped")
+
+
+@app.command()
+def streams() -> None:
+    """List the internet radio stations configured for 'sweep --source stream'."""
+    stations = runtime.load_streams()
+    if not stations:
+        typer.echo(f"no stations configured -- add some to {runtime.STREAMS_FILE}")
+        return
+    for s in stations:
+        typer.echo(f"{s['name']}: {s['url']}")
 
 
 def main() -> None:

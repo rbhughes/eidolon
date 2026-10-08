@@ -43,6 +43,14 @@ def check_device() -> tuple[bool, str]:
     return False, f"device not detected: {output.strip()}"
 
 
+def check_ffmpeg() -> tuple[bool, str]:
+    """ffmpeg is only needed for the internet-radio ('stream') sweep
+    source, not core SDR capture -- informational, doesn't fail the run."""
+    if shutil.which("ffmpeg") is None:
+        return False, "ffmpeg not found (only needed for 'sweep --source stream')"
+    return True, "found"
+
+
 def check_capture() -> tuple[bool, str]:
     """Run rtl_fm briefly and confirm it actually produces audio bytes."""
     try:
@@ -78,6 +86,11 @@ def main() -> None:
         all_ok &= ok
         status = "OK" if ok else "FAIL"
         print(f"[{name}] {status}: {detail}")
+
+    # Informational only -- not required for core SDR functionality, so it
+    # doesn't affect the exit code.
+    ok, detail = check_ffmpeg()
+    print(f"[ffmpeg] {'OK' if ok else 'WARN'}: {detail}")
 
     sys.exit(0 if all_ok else 1)
 
