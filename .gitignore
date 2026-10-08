@@ -12,3 +12,6 @@ build/
 
 /.run/
 /recordings/
+
+# Claude Code local session state (not project content)
+/.claude/
