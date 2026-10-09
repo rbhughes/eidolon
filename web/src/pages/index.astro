@@ -1,0 +1,336 @@
+---
+---
+
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+		<meta name="viewport" content="width=device-width" />
+		<meta name="generator" content={Astro.generator} />
+		<title>Eidolon</title>
+	</head>
+	<body>
+		<main>
+			<h1>Eidolon</h1>
+			<p class="sub">a radio-static spirit box. hop through live stations, capture a few seconds, see what comes through.</p>
+
+			<audio id="player"></audio>
+
+			<div class="panel">
+				<div class="station" id="station">-- not tuned in --</div>
+				<div class="controls">
+					<button id="tune">tune in</button>
+					<button id="capture" disabled>capture</button>
+				</div>
+			</div>
+
+			<div class="log" id="log">
+				<p class="hint">transcript will appear here</p>
+			</div>
+		</main>
+
+		<script>
+			import { STATIONS, pickWeighted } from '../data/stations';
+			import { StationBuffer } from '../lib/stationBuffer';
+			import { MsePlayer } from '../lib/msePlayer';
+
+			const player = document.getElementById('player') as HTMLAudioElement;
+			const stationEl = document.getElementById('station') as HTMLDivElement;
+			const tuneBtn = document.getElementById('tune') as HTMLButtonElement;
+			const captureBtn = document.getElementById('capture') as HTMLButtonElement;
+			const log = document.getElementById('log') as HTMLDivElement;
+
+			const HOP_MS = 3000;
+			const BUFFER_WINDOW_MS = 60_000;
+			const MAX_CAPTURE_MS = 60_000; // safety cap if you wait a while before capturing
+
+			let current = STATIONS[0];
+			let hopTimer: ReturnType<typeof setInterval> | null = null;
+			let tunedIn = false;
+			let lastCaptureTime = Date.now();
+
+			const buffer = new StationBuffer(STATIONS, BUFFER_WINDOW_MS);
+
+			// MSE+raw-mp3 support is inconsistent across browsers (e.g. Firefox
+			// on Linux rejects it outright) -- when it's not usable, fall back
+			// to direct-URL playback (audio.src = station.url, reconnecting
+			// each hop) rather than go silent. Capture/translation accuracy is
+			// unaffected either way; only "does playback byte-match capture"
+			// degrades on the fallback path.
+			const mseSupported = MsePlayer.isSupported();
+			const msePlayer = mseSupported ? new MsePlayer() : null;
+			if (msePlayer) {
+				msePlayer.attach(player);
+				// Playback fed from the exact same real-time bytes the capture
+				// buffer records, so what you hear and what gets captured can
+				// never disagree.
+				buffer.setOnLiveChunk((bytes) => msePlayer.feed(bytes));
+			} else {
+				console.warn('[player] MSE+audio/mpeg unsupported here -- falling back to direct stream URLs per hop');
+			}
+
+			function renderStation() {
+				stationEl.textContent = current.name;
+			}
+
+			function hop() {
+				current = pickWeighted();
+				renderStation();
+				buffer.recordHop(current.id, current.name);
+
+				// Re-checked every hop, not just once: a real SourceBuffer
+				// error can surface mid-session (measured on Chromium), after
+				// which hasFailed() flips true and we need to switch over.
+				if (msePlayer && !msePlayer.hasFailed()) {
+					msePlayer.cutover();
+				} else {
+					if (msePlayer) buffer.setOnLiveChunk(null); // stop feeding a dead MSE pipeline
+					player.src = current.url;
+					player.play().catch(() => {
+						/* ignore -- a hop mid-unlock race is harmless, next hop recovers */
+					});
+				}
+			}
+
+			function startHopping() {
+				buffer.start(STATIONS);
+				hop();
+				if (msePlayer) {
+					player.play().catch(() => {
+						/* ignore -- browser may need another user gesture; capture still works */
+					});
+				}
+				hopTimer = setInterval(hop, HOP_MS);
+			}
+
+			function stopHopping() {
+				if (hopTimer !== null) {
+					clearInterval(hopTimer);
+					hopTimer = null;
+				}
+				player.pause();
+				buffer.stop();
+			}
+
+			// Don't keep hopping stations / streaming audio to a hidden tab.
+			document.addEventListener('visibilitychange', () => {
+				if (!tunedIn) return;
+				if (document.hidden) {
+					stopHopping();
+				} else if (hopTimer === null) {
+					startHopping();
+				}
+			});
+
+			function clearHint() {
+				const hint = log.querySelector('.hint');
+				if (hint) hint.remove();
+			}
+
+			function appendEntry(timestamp: string, station: string, text: string) {
+				clearHint();
+				const entry = document.createElement('div');
+				entry.className = 'entry';
+				const time = new Date(timestamp).toLocaleTimeString();
+				entry.innerHTML = `<span class="time">${time}</span><span class="from">${station}</span><span class="text"></span>`;
+				entry.querySelector('.text')!.textContent = text || '(silence)';
+				log.prepend(entry);
+			}
+
+			tuneBtn.addEventListener('click', () => {
+				if (tunedIn) return;
+				tunedIn = true;
+				tuneBtn.textContent = 'tuned in';
+				tuneBtn.disabled = true;
+				captureBtn.disabled = false;
+				lastCaptureTime = Date.now();
+				startHopping();
+			});
+
+			captureBtn.addEventListener('click', async () => {
+				captureBtn.disabled = true;
+				captureBtn.textContent = 'transcribing...';
+
+				// Everything buffered since the *previous* capture (or since
+				// tune-in, for the first one), capped so an unusually long gap
+				// before capturing can't balloon the clip.
+				const now = Date.now();
+				const cutoff = Math.max(lastCaptureTime, now - MAX_CAPTURE_MS);
+				lastCaptureTime = now;
+
+				const chunks = buffer.since(cutoff);
+				if (chunks.length === 0) {
+					appendEntry(new Date().toISOString(), '--', '(nothing buffered yet)');
+					captureBtn.disabled = false;
+					captureBtn.textContent = 'capture';
+					return;
+				}
+
+				const labels: string[] = [];
+				for (const c of chunks) {
+					if (labels.length === 0 || labels[labels.length - 1] !== c.station) labels.push(c.station);
+				}
+				const labelSummary = labels.join(' -> ');
+
+				const totalLen = chunks.reduce((n, c) => n + c.bytes.length, 0);
+				const combined = new Uint8Array(totalLen);
+				let offset = 0;
+				for (const c of chunks) {
+					combined.set(c.bytes, offset);
+					offset += c.bytes.length;
+				}
+
+				const formData = new FormData();
+				formData.append('file', new Blob([combined as BlobPart], { type: 'audio/mpeg' }), 'clip.mp3');
+
+				console.log(
+					`[capture] window=${((now - cutoff) / 1000).toFixed(1)}s bytes=${totalLen} chunks=${chunks.length} labels=${labelSummary}`
+				);
+				const fetchStart = performance.now();
+
+				try {
+					const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+					console.log(`[capture] /api/transcribe responded in ${(performance.now() - fetchStart).toFixed(0)}ms`);
+					const data = await res.json();
+					if (data.ok) {
+						appendEntry(data.timestamp, labelSummary, data.text);
+					} else {
+						appendEntry(new Date().toISOString(), labelSummary, `[capture failed: ${data.error}]`);
+					}
+				} catch (err) {
+					appendEntry(new Date().toISOString(), labelSummary, `[capture failed: ${err}]`);
+				} finally {
+					captureBtn.disabled = false;
+					captureBtn.textContent = 'capture';
+				}
+			});
+		</script>
+
+		<style>
+			:root {
+				--bg: #0a0a0d;
+				--panel: #15131a;
+				--fg: #d8d0e0;
+				--dim: #6e647f;
+				--accent: #7b5fd1;
+				--accent-glow: #a78bfa;
+			}
+
+			* {
+				box-sizing: border-box;
+			}
+
+			html,
+			body {
+				margin: 0;
+				background: var(--bg);
+				color: var(--fg);
+				font-family: 'Courier New', ui-monospace, monospace;
+			}
+
+			main {
+				max-width: 640px;
+				margin: 0 auto;
+				padding: 3rem 1.25rem 4rem;
+			}
+
+			h1 {
+				font-size: 1.8rem;
+				letter-spacing: 0.15em;
+				text-transform: lowercase;
+				color: var(--accent-glow);
+				text-shadow: 0 0 18px rgba(167, 139, 250, 0.5);
+				margin: 0 0 0.5rem;
+			}
+
+			.sub {
+				color: var(--dim);
+				font-size: 0.9rem;
+				line-height: 1.5;
+				margin: 0 0 2rem;
+			}
+
+			.panel {
+				background: var(--panel);
+				border: 1px solid #2a2433;
+				border-radius: 8px;
+				padding: 1.25rem;
+				margin-bottom: 1.5rem;
+			}
+
+			.station {
+				font-size: 1.1rem;
+				letter-spacing: 0.08em;
+				color: var(--accent-glow);
+				margin-bottom: 1rem;
+				min-height: 1.4em;
+			}
+
+			.controls {
+				display: flex;
+				gap: 0.75rem;
+			}
+
+			button {
+				flex: 1;
+				background: transparent;
+				color: var(--fg);
+				border: 1px solid var(--accent);
+				border-radius: 6px;
+				padding: 0.7rem 1rem;
+				font-family: inherit;
+				font-size: 0.95rem;
+				letter-spacing: 0.05em;
+				cursor: pointer;
+				transition: background 0.15s, color 0.15s;
+			}
+
+			button:hover:not(:disabled) {
+				background: var(--accent);
+				color: #fff;
+			}
+
+			button:disabled {
+				opacity: 0.4;
+				cursor: default;
+			}
+
+			.log {
+				display: flex;
+				flex-direction: column;
+				gap: 0.9rem;
+			}
+
+			.hint {
+				color: var(--dim);
+				font-size: 0.85rem;
+			}
+
+			.entry {
+				display: grid;
+				grid-template-columns: auto 1fr;
+				gap: 0.15rem 0.6rem;
+				font-size: 0.9rem;
+				line-height: 1.45;
+				border-left: 2px solid #2a2433;
+				padding-left: 0.75rem;
+			}
+
+			.time {
+				color: var(--dim);
+				font-size: 0.75rem;
+			}
+
+			.from {
+				grid-column: 2;
+				color: var(--accent-glow);
+				font-size: 0.75rem;
+				letter-spacing: 0.04em;
+			}
+
+			.text {
+				grid-column: 1 / -1;
+			}
+		</style>
+	</body>
+</html>
