@@ -153,10 +153,11 @@ def _make_hop_picker(source: str, band: tuple[float, float], hotspot_bias: float
     streams = load_streams() if source == "stream" else []
     if source == "stream" and not streams:
         raise RuntimeError(f"no stations configured -- add some to {STREAMS_FILE}")
+    stream_weights = [s.get("weight", 1) for s in streams]
 
     def _next_hop() -> tuple[str, list[str]]:
         if source == "stream":
-            station = random.choice(streams)
+            station = random.choices(streams, weights=stream_weights, k=1)[0]
             return station["name"], _ffmpeg_stream_cmd(station["url"])
         if hotspots and random.random() < hotspot_bias:
             freq_hz = random.choice(hotspots)["freq_hz"]

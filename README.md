@@ -49,6 +49,9 @@ interactive terminal.
 
 - `OPENROUTER_API_KEY` -- required for transcription; set in your
   environment or a local, gitignored `.env`.
-- `streams.json` -- list of `{"name", "url"}` internet radio stations for
-  `sweep --source stream`. Checked into the repo as a starting seed list;
+- `streams.json` -- list of `{"name", "url", "weight"}` internet radio
+  stations for `sweep --source stream`/`scrub`. `weight` (default 1) is a
+  relative selection weight -- bias toward talk/news stations over music
+  ones, since music chunks reliably come back empty (nothing to
+  transcribe, not a bug). Checked into the repo as a starting seed list;
   edit freely to add your own.

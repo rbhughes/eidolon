@@ -188,7 +188,7 @@ def streams() -> None:
         typer.echo(f"no stations configured -- add some to {runtime.STREAMS_FILE}")
         return
     for s in stations:
-        typer.echo(f"{s['name']}: {s['url']}")
+        typer.echo(f"{s['name']} (weight {s.get('weight', 1)}): {s['url']}")
 
 
 @app.command()
