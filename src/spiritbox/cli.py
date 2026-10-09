@@ -217,8 +217,15 @@ def scrub(
     hotspot_bias: float = typer.Option(
         0.6, "--hotspot-bias", help="sdr source only: fraction of hops biased toward scan()-found stations"
     ),
-    mark_seconds: float = typer.Option(5.0, "--mark-seconds", "-m", help="Trailing seconds of audio a mark captures"),
-    buffer_seconds: float = typer.Option(60.0, "--buffer-seconds", help="How much audio history stays available to mark"),
+    max_mark_seconds: float = typer.Option(
+        60.0,
+        "--max-mark-seconds",
+        "-m",
+        help="Cap on how far back a mark can reach if you wait a while between marks",
+    ),
+    buffer_seconds: float = typer.Option(
+        75.0, "--buffer-seconds", help="How much audio history stays available to mark (keep above --max-mark-seconds)"
+    ),
     dedup: bool = typer.Option(
         True, "--dedup/--no-dedup", help="Exclude chunks that exactly repeat recent audio (a looping stream relay) from marks"
     ),
@@ -226,14 +233,18 @@ def scrub(
     translate: bool = typer.Option(
         True, "--translate/--no-translate", help="Translate non-English transcripts to English via a second LLM call"
     ),
+    show_transcript: bool = typer.Option(
+        False, "--show-transcript", help="Print every marked segment again, in order, when you quit"
+    ),
 ) -> None:
     """Continuously sweep and play live without auto-transcribing.
 
-    Press SPACE to mark the last few seconds of audio for transcription,
-    'q' to quit. Unlike 'sweep', nothing is sent to OpenRouter until you
-    say so -- you decide by ear what's worth transcribing, which sidesteps
-    the dead-air/static gate entirely and lets hops be much shorter/faster
-    since most of them are never sent anywhere.
+    Press SPACE to mark everything heard since the last mark (or since
+    start, for the first one) for transcription, 'q' to quit. Unlike
+    'sweep', nothing is sent to OpenRouter until you say so -- you decide
+    by ear what's worth transcribing, which sidesteps the dead-air/static
+    gate entirely and lets hops be much shorter/faster since most of them
+    are never sent anywhere.
 
     Requires an interactive terminal (reads raw keypresses from stdin).
     """
@@ -246,8 +257,8 @@ def scrub(
     def on_chunk(label: str, index: int) -> None:
         typer.echo(f"\r[{index}] {label:<24}", nl=False)
 
-    def on_transcript(label_summary: str, text: str) -> None:
-        typer.echo(f"\n>> {label_summary}: {text!r}")
+    def on_transcript(timestamp: str, label_summary: str, text: str) -> None:
+        typer.echo(f"\n>> [{timestamp}] {label_summary}: {text!r}")
 
     def on_profile(label: str, index: int, is_duplicate: bool) -> None:
         if is_duplicate:
@@ -272,7 +283,7 @@ def scrub(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1)
 
-    typer.echo(f"scrubbing -- SPACE marks the last {mark_seconds:.0f}s for transcription, q quits")
+    typer.echo(f"scrubbing -- SPACE marks everything since the last mark (capped at {max_mark_seconds:.0f}s), q quits")
     session.start()
 
     fd = sys.stdin.fileno()
@@ -286,7 +297,7 @@ def scrub(
             ch = sys.stdin.read(1)
             if ch == " ":
                 typer.echo("\n[marked]")
-                session.mark(window_seconds=mark_seconds)
+                session.mark(max_window_seconds=max_mark_seconds)
             elif ch in ("q", "Q"):
                 break
     except KeyboardInterrupt:
@@ -295,6 +306,14 @@ def scrub(
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         typer.echo("\nstopping...")
         session.stop()
+
+    if show_transcript:
+        transcript = session.get_transcript()
+        typer.echo("\n--- full transcript ---")
+        if not transcript:
+            typer.echo("(nothing marked)")
+        for timestamp, label_summary, text in transcript:
+            typer.echo(f"[{timestamp}] {label_summary}: {text!r}")
 
 
 def main() -> None:

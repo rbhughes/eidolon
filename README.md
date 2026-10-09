@@ -47,13 +47,17 @@ translation fails, the original transcript is kept with a note appended
 rather than being dropped.
 
 `scrub` is the faster, more "ghost box"-like mode: it hops and plays
-continuously without auto-transcribing anything. Press SPACE to send the
-last few seconds to OpenRouter, `q` to quit. Because nothing is sent
-automatically, hops can be much shorter (default 1.5s vs sweep's 3s) --
-in practice per-hop subprocess/connection overhead caps real-world speed
-around 2-3s/hop either way, well short of a hardware ghost box's rapid
-tuner-based switching, but noticeably snappier than `sweep`. Needs an
-interactive terminal.
+continuously without auto-transcribing anything. Press SPACE to send
+everything heard since the *last* mark (or since start, for the first
+one) to OpenRouter -- not just a fixed trailing window, so nothing said
+between two marks is lost -- capped at `--max-mark-seconds` (default 60s)
+in case you wait a while before marking. `q` quits, and `--show-transcript`
+reprints every marked segment in order (with timestamps) before exiting.
+Because nothing is sent automatically, hops can be much shorter (default
+1.5s vs sweep's 3s) -- in practice per-hop subprocess/connection overhead
+caps real-world speed around 2-3s/hop either way, well short of a
+hardware ghost box's rapid tuner-based switching, but noticeably snappier
+than `sweep`. Needs an interactive terminal.
 
 ## Configuration
 

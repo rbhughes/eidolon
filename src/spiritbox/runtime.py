@@ -18,6 +18,7 @@ import threading
 import time
 import wave
 from collections import deque
+from datetime import datetime
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -479,6 +480,10 @@ class _BufferedChunk:
     is_duplicate: bool = False
 
 
+def _fmt_clock(epoch_seconds: float) -> str:
+    return datetime.fromtimestamp(epoch_seconds).strftime("%H:%M:%S")
+
+
 class ScrubSession:
     """Continuously hops and plays live, like sweep(), but does NOT
     auto-transcribe every chunk. Instead it keeps a rolling buffer so the
@@ -491,6 +496,13 @@ class ScrubSession:
     dedup.py) -- some stream relays intermittently loop a short segment
     instead of true live audio. Flagged chunks still play live (the user
     heard it happen regardless) but are excluded from mark()'s audio.
+
+    mark() grabs every clean chunk buffered since the *previous* mark (or
+    since the session started, for the first one), not just a fixed
+    trailing window -- so nothing said between two marks gets lost. The
+    `max_window_seconds` passed to mark() is only a safety cap for a long
+    gap between marks; `buffer_seconds` must be at least that large or
+    the ring buffer will trim audio before a mark can reach it.
     """
 
     def __init__(
@@ -500,12 +512,12 @@ class ScrubSession:
         hotspot_bias: float = 0.6,
         volume: int = DEFAULT_VOLUME,
         source: str = "sdr",
-        buffer_seconds: float = 60.0,
+        buffer_seconds: float = 75.0,
         dedup: bool = True,
         dedup_window_seconds: float = 120.0,
         translate: bool = True,
         on_chunk: Callable[[str, int], None] | None = None,
-        on_transcript: Callable[[str, str], None] | None = None,
+        on_transcript: Callable[[str, str, str], None] | None = None,
         on_profile: Callable[[str, int, bool], None] | None = None,
     ) -> None:
         if is_running() is not None:
@@ -525,6 +537,9 @@ class ScrubSession:
         self._thread: threading.Thread | None = None
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._index = 0
+        self._last_mark_time = time.time()
+        self._history: list[tuple[str, str, str]] = []
+        self._history_lock = threading.Lock()
 
         from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-scrub commands
         from spiritbox import transcribe
@@ -577,29 +592,32 @@ class ScrubSession:
 
             self._index += 1
 
-    def mark(self, window_seconds: float = 5.0) -> None:
-        """Grab roughly the last `window_seconds` of buffered audio and
-        submit it for transcription in the background."""
-        cutoff = time.time() - window_seconds
+    def mark(self, max_window_seconds: float = 60.0) -> None:
+        """Grab every clean chunk buffered since the previous mark (or
+        session start), capped at `max_window_seconds` back from now so a
+        long gap between marks can't balloon the transcription, and submit
+        it for transcription in the background."""
+        now = time.time()
+        cutoff = max(self._last_mark_time, now - max_window_seconds)
+        self._last_mark_time = now
+        timestamp = f"{_fmt_clock(cutoff)}-{_fmt_clock(now)}"
+
         with self._buffer_lock:
             chunks = [c for c in self._buffer if c.t_end >= cutoff]
 
         if not chunks:
             if self._on_transcript is not None:
-                self._on_transcript("(nothing buffered yet)", "")
+                self._on_transcript(timestamp, "(nothing buffered yet)", "")
             return
 
         clean_chunks = [c for c in chunks if not c.is_duplicate]
         if not clean_chunks:
             if self._on_transcript is not None:
-                self._on_transcript("(skipped: buffered audio was all duplicate/looping)", "")
+                self._on_transcript(timestamp, "(skipped: buffered audio was all duplicate/looping)", "")
             return
         chunks = clean_chunks
 
         pcm = b"".join(c.pcm for c in chunks)
-        target_bytes = int(window_seconds * AUDIO_RATE_HZ * 2)
-        if len(pcm) > target_bytes:
-            pcm = pcm[-target_bytes:]
 
         labels: list[str] = []
         for c in chunks:
@@ -607,11 +625,15 @@ class ScrubSession:
                 labels.append(c.label)
         label_summary = " -> ".join(labels)
 
-        self._executor.submit(self._transcribe_and_report, _pcm_to_wav_bytes(pcm), label_summary)
+        self._executor.submit(self._transcribe_and_report, _pcm_to_wav_bytes(pcm), label_summary, timestamp)
 
-    def _transcribe_and_report(self, wav_bytes: bytes, label_summary: str) -> None:
-        if self._on_transcript is None:
-            return
+    def get_transcript(self) -> list[tuple[str, str, str]]:
+        """Return (timestamp, label_summary, text) for every mark so far,
+        in order."""
+        with self._history_lock:
+            return list(self._history)
+
+    def _transcribe_and_report(self, wav_bytes: bytes, label_summary: str, timestamp: str) -> None:
         try:
             text = self._transcribe.transcribe_wav(wav_bytes)
         except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
@@ -622,7 +644,12 @@ class ScrubSession:
                     text = self._translate_module.translate_to_english(text)
                 except Exception as exc:  # noqa: BLE001 -- keep the original transcript if translation fails
                     text = f"{text} [translation failed: {exc}]"
-        self._on_transcript(label_summary, text)
+
+        with self._history_lock:
+            self._history.append((timestamp, label_summary, text))
+
+        if self._on_transcript is not None:
+            self._on_transcript(timestamp, label_summary, text)
 
     def stop(self) -> None:
         self._stop_event.set()
