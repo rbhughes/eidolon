@@ -17,8 +17,10 @@ import subprocess
 import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -137,6 +139,64 @@ def load_hotspots() -> list[dict]:
         return json.loads(HOTSPOTS_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def _make_hop_picker(source: str, band: tuple[float, float], hotspot_bias: float) -> Callable[[], tuple[str, list[str]]]:
+    """Build a closure that picks the next hop's (label, capture command).
+
+    Shared by sweep() and ScrubSession so both sources (SDR frequencies,
+    internet radio stations) are only implemented once.
+    """
+    if source not in ("sdr", "stream"):
+        raise ValueError(f"unknown source: {source!r} (expected 'sdr' or 'stream')")
+    hotspots = load_hotspots() if source == "sdr" and hotspot_bias > 0 else []
+    streams = load_streams() if source == "stream" else []
+    if source == "stream" and not streams:
+        raise RuntimeError(f"no stations configured -- add some to {STREAMS_FILE}")
+
+    def _next_hop() -> tuple[str, list[str]]:
+        if source == "stream":
+            station = random.choice(streams)
+            return station["name"], _ffmpeg_stream_cmd(station["url"])
+        if hotspots and random.random() < hotspot_bias:
+            freq_hz = random.choice(hotspots)["freq_hz"]
+        else:
+            freq_hz = _random_valid_channel(band)
+        freq = f"{freq_hz / 1e6:.1f}M"
+        return freq, _rtl_fm_cmd(freq)
+
+    return _next_hop
+
+
+def _capture_chunk(cmd: list[str], chunk_bytes_target: int, player_stdin, max_wait: float) -> bytes:
+    """Run `cmd`, streaming its stdout into `player_stdin` (if given) while
+    collecting up to `chunk_bytes_target` bytes. A watchdog timer bounds
+    worst-case hang if the source stalls (stream connections can; SDR
+    tuning rarely does, but the safety net is free)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert proc.stdout is not None
+    watchdog = threading.Timer(max_wait, proc.kill)
+    watchdog.start()
+    collected = bytearray()
+    try:
+        while len(collected) < chunk_bytes_target:
+            data = proc.stdout.read(4096)
+            if not data:
+                break
+            collected.extend(data)
+            if player_stdin is not None:
+                try:
+                    player_stdin.write(data)
+                except BrokenPipeError:
+                    pass
+    finally:
+        watchdog.cancel()
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return bytes(collected)
 
 
 def load_streams() -> list[dict]:
@@ -320,29 +380,13 @@ def sweep(
     is always called with the computed stats regardless of gate/pass-fail,
     for calibration/debugging.
     """
-    if source not in ("sdr", "stream"):
-        raise ValueError(f"unknown source: {source!r} (expected 'sdr' or 'stream')")
     if is_running() is not None:
         raise RuntimeError("live monitor is running -- run stop first")
 
+    next_hop = _make_hop_picker(source, band, hotspot_bias)
     stop_event = stop_event or threading.Event()
     bytes_per_second = AUDIO_RATE_HZ * 2  # 16-bit mono
     chunk_bytes_target = int(bytes_per_second * chunk_seconds)
-    hotspots = load_hotspots() if source == "sdr" and hotspot_bias > 0 else []
-    streams = load_streams() if source == "stream" else []
-    if source == "stream" and not streams:
-        raise RuntimeError(f"no stations configured -- add some to {STREAMS_FILE}")
-
-    def _next_hop() -> tuple[str, list[str]]:
-        if source == "stream":
-            station = random.choice(streams)
-            return station["name"], _ffmpeg_stream_cmd(station["url"])
-        if hotspots and random.random() < hotspot_bias:
-            freq_hz = random.choice(hotspots)["freq_hz"]
-        else:
-            freq_hz = _random_valid_channel(band)
-        freq = f"{freq_hz / 1e6:.1f}M"
-        return freq, _rtl_fm_cmd(freq)
 
     player = subprocess.Popen(
         [
@@ -382,34 +426,11 @@ def sweep(
                 if total_seconds is not None and time.time() - start_time >= total_seconds:
                     break
 
-                label, cmd = _next_hop()
+                label, cmd = next_hop()
                 if on_chunk is not None:
                     on_chunk(label, index)
 
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                assert proc.stdout is not None
-                watchdog = threading.Timer(max_chunk_wait, proc.kill)
-                watchdog.start()
-                collected = bytearray()
-                try:
-                    while len(collected) < chunk_bytes_target:
-                        data = proc.stdout.read(4096)
-                        if not data:
-                            break
-                        collected.extend(data)
-                        try:
-                            player.stdin.write(data)
-                        except BrokenPipeError:
-                            pass
-                finally:
-                    watchdog.cancel()
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-
-                pcm_bytes = bytes(collected)
+                pcm_bytes = _capture_chunk(cmd, chunk_bytes_target, player.stdin, max_chunk_wait)
                 passed, _reason, stats = audiocheck.is_worth_transcribing(
                     pcm_bytes, AUDIO_RATE_HZ, silence_dbfs=silence_dbfs, max_flatness=max_flatness
                 )
@@ -428,3 +449,136 @@ def sweep(
         except OSError:
             pass
         _terminate(player.pid)
+
+
+@dataclass
+class _BufferedChunk:
+    label: str
+    pcm: bytes
+    t_end: float
+
+
+class ScrubSession:
+    """Continuously hops and plays live, like sweep(), but does NOT
+    auto-transcribe every chunk. Instead it keeps a rolling buffer so the
+    caller can mark() a recent stretch of audio on demand -- the user's ear
+    decides what's worth sending to the API, not a statistical gate. This
+    also means chunks can be much shorter (faster perceived hopping)
+    without driving up API cost, since most hops are never transcribed.
+    """
+
+    def __init__(
+        self,
+        chunk_seconds: float = 1.5,
+        band: tuple[float, float] = (88.0e6, 108.0e6),
+        hotspot_bias: float = 0.6,
+        volume: int = DEFAULT_VOLUME,
+        source: str = "sdr",
+        buffer_seconds: float = 60.0,
+        on_chunk: Callable[[str, int], None] | None = None,
+        on_transcript: Callable[[str, str], None] | None = None,
+    ) -> None:
+        if is_running() is not None:
+            raise RuntimeError("live monitor is running -- run stop first")
+
+        self._next_hop = _make_hop_picker(source, band, hotspot_bias)
+        self._chunk_seconds = chunk_seconds
+        self._buffer_seconds = buffer_seconds
+        self._on_chunk = on_chunk
+        self._on_transcript = on_transcript
+
+        self._buffer: deque[_BufferedChunk] = deque()
+        self._buffer_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._index = 0
+
+        from spiritbox import transcribe  # local import: keep OpenRouter optional for non-scrub commands
+
+        self._transcribe = transcribe
+
+        self._player = subprocess.Popen(
+            [
+                "paplay",
+                "--raw",
+                f"--rate={AUDIO_RATE_HZ}",
+                "--format=s16le",
+                "--channels=1",
+                "--client-name=spiritbox-scrub",
+                f"--volume={volume}",
+            ],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        assert self._player.stdin is not None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        bytes_per_second = AUDIO_RATE_HZ * 2
+        chunk_bytes_target = int(bytes_per_second * self._chunk_seconds)
+        max_chunk_wait = self._chunk_seconds + 5.0
+
+        while not self._stop_event.is_set():
+            label, cmd = self._next_hop()
+            if self._on_chunk is not None:
+                self._on_chunk(label, self._index)
+
+            pcm = _capture_chunk(cmd, chunk_bytes_target, self._player.stdin, max_chunk_wait)
+            t_end = time.time()
+
+            with self._buffer_lock:
+                self._buffer.append(_BufferedChunk(label=label, pcm=pcm, t_end=t_end))
+                cutoff = t_end - self._buffer_seconds
+                while self._buffer and self._buffer[0].t_end < cutoff:
+                    self._buffer.popleft()
+
+            self._index += 1
+
+    def mark(self, window_seconds: float = 5.0) -> None:
+        """Grab roughly the last `window_seconds` of buffered audio and
+        submit it for transcription in the background."""
+        cutoff = time.time() - window_seconds
+        with self._buffer_lock:
+            chunks = [c for c in self._buffer if c.t_end >= cutoff]
+
+        if not chunks:
+            if self._on_transcript is not None:
+                self._on_transcript("(nothing buffered yet)", "")
+            return
+
+        pcm = b"".join(c.pcm for c in chunks)
+        target_bytes = int(window_seconds * AUDIO_RATE_HZ * 2)
+        if len(pcm) > target_bytes:
+            pcm = pcm[-target_bytes:]
+
+        labels: list[str] = []
+        for c in chunks:
+            if not labels or labels[-1] != c.label:
+                labels.append(c.label)
+        label_summary = " -> ".join(labels)
+
+        self._executor.submit(self._transcribe_and_report, _pcm_to_wav_bytes(pcm), label_summary)
+
+    def _transcribe_and_report(self, wav_bytes: bytes, label_summary: str) -> None:
+        if self._on_transcript is None:
+            return
+        try:
+            text = self._transcribe.transcribe_wav(wav_bytes)
+        except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
+            text = f"[transcription failed: {exc}]"
+        self._on_transcript(label_summary, text)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._executor.shutdown(wait=True)
+        try:
+            self._player.stdin.close()
+        except OSError:
+            pass
+        _terminate(self._player.pid)

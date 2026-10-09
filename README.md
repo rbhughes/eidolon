@@ -29,11 +29,21 @@ uv run spiritbox scan                        # find local FM stations -> .run/ho
 uv run spiritbox sweep                       # hop + transcribe, SDR source (default)
 uv run spiritbox sweep --source stream       # hop + transcribe, internet radio source
 uv run spiritbox streams                     # list configured internet radio stations
+uv run spiritbox scrub                       # fast hop + live play, manual mark-to-transcribe
 uv run spiritbox --help
 ```
 
 `sweep` statistically gates out dead air and static before spending an API
 call on transcription (see `--debug-stats` to inspect/tune thresholds).
+
+`scrub` is the faster, more "ghost box"-like mode: it hops and plays
+continuously without auto-transcribing anything. Press SPACE to send the
+last few seconds to OpenRouter, `q` to quit. Because nothing is sent
+automatically, hops can be much shorter (default 1.5s vs sweep's 3s) --
+in practice per-hop subprocess/connection overhead caps real-world speed
+around 2-3s/hop either way, well short of a hardware ghost box's rapid
+tuner-based switching, but noticeably snappier than `sweep`. Needs an
+interactive terminal.
 
 ## Configuration
 

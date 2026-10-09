@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import select
+import sys
+import termios
+import tty
 from datetime import datetime
 from pathlib import Path
 
@@ -185,6 +189,85 @@ def streams() -> None:
         return
     for s in stations:
         typer.echo(f"{s['name']}: {s['url']}")
+
+
+@app.command()
+def scrub(
+    chunk_seconds: float = typer.Option(
+        1.5, "--chunk-seconds", "-c", help="Seconds of audio per hop (shorter = faster perceived sweep)"
+    ),
+    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range (sdr source only)"),
+    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range (sdr source only)"),
+    volume: int = typer.Option(runtime.DEFAULT_VOLUME, "--volume", "-v", help="Linear playback volume"),
+    source: str = typer.Option(
+        "sdr", "--source", help="Where chunks come from: 'sdr' (RTL-SDR dongle) or 'stream' (internet radio)"
+    ),
+    hotspot_bias: float = typer.Option(
+        0.6, "--hotspot-bias", help="sdr source only: fraction of hops biased toward scan()-found stations"
+    ),
+    mark_seconds: float = typer.Option(5.0, "--mark-seconds", "-m", help="Trailing seconds of audio a mark captures"),
+    buffer_seconds: float = typer.Option(60.0, "--buffer-seconds", help="How much audio history stays available to mark"),
+) -> None:
+    """Continuously sweep and play live without auto-transcribing.
+
+    Press SPACE to mark the last few seconds of audio for transcription,
+    'q' to quit. Unlike 'sweep', nothing is sent to OpenRouter until you
+    say so -- you decide by ear what's worth transcribing, which sidesteps
+    the dead-air/static gate entirely and lets hops be much shorter/faster
+    since most of them are never sent anywhere.
+
+    Requires an interactive terminal (reads raw keypresses from stdin).
+    """
+    if not sys.stdin.isatty():
+        typer.echo("error: 'scrub' needs an interactive terminal (stdin is not a tty)", err=True)
+        raise typer.Exit(1)
+
+    band = (_parse_freq(band_low), _parse_freq(band_high))
+
+    def on_chunk(label: str, index: int) -> None:
+        typer.echo(f"\r[{index}] {label:<24}", nl=False)
+
+    def on_transcript(label_summary: str, text: str) -> None:
+        typer.echo(f"\n>> {label_summary}: {text!r}")
+
+    try:
+        session = runtime.ScrubSession(
+            chunk_seconds=chunk_seconds,
+            band=band,
+            hotspot_bias=hotspot_bias,
+            volume=volume,
+            source=source,
+            buffer_seconds=buffer_seconds,
+            on_chunk=on_chunk,
+            on_transcript=on_transcript,
+        )
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(f"scrubbing -- SPACE marks the last {mark_seconds:.0f}s for transcription, q quits")
+    session.start()
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not ready:
+                continue
+            ch = sys.stdin.read(1)
+            if ch == " ":
+                typer.echo("\n[marked]")
+                session.mark(window_seconds=mark_seconds)
+            elif ch in ("q", "Q"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        typer.echo("\nstopping...")
+        session.stop()
 
 
 def main() -> None:
