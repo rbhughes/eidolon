@@ -34,7 +34,11 @@ uv run spiritbox --help
 ```
 
 `sweep` statistically gates out dead air and static before spending an API
-call on transcription (see `--debug-stats` to inspect/tune thresholds).
+call on transcription (see `--debug-stats` to inspect/tune thresholds). It
+also skips chunks that exactly repeat recent audio -- some internet radio
+relays intermittently loop a short segment instead of true live audio
+(`--dedup`/`--no-dedup`, `--dedup-window`). `scrub` applies the same check
+to exclude repeated chunks from what gets sent when you mark.
 
 `scrub` is the faster, more "ghost box"-like mode: it hops and plays
 continuously without auto-transcribing anything. Press SPACE to send the

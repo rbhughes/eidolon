@@ -356,6 +356,8 @@ def sweep(
     gate: bool = True,
     silence_dbfs: float = -50.0,
     max_flatness: float = 0.45,
+    dedup: bool = True,
+    dedup_window_seconds: float = 120.0,
     source: str = "sdr",
     on_chunk: Callable[[str, int], None] | None = None,
     on_transcript: Callable[[str, int, str], None] | None = None,
@@ -377,9 +379,13 @@ def sweep(
 
     When `gate` is True, each chunk is statistically profiled (see
     audiocheck.py) before being sent for transcription -- dead air and
-    static are skipped without spending an API call. `on_profile`, if set,
-    is always called with the computed stats regardless of gate/pass-fail,
-    for calibration/debugging.
+    static are skipped without spending an API call. When `dedup` is True,
+    each chunk is also checked against recent chunks (see dedup.py) --
+    some stream relays intermittently loop a short segment instead of
+    true live audio, and an exact repeat is skipped the same way. Either
+    check can make `passed` False; `on_profile`, if set, is always called
+    with the computed stats (including a "duplicate" key) regardless of
+    pass/fail, for calibration/debugging.
     """
     if is_running() is not None:
         raise RuntimeError("live monitor is running -- run stop first")
@@ -404,7 +410,9 @@ def sweep(
     )
     assert player.stdin is not None
 
-    from spiritbox import audiocheck, transcribe  # local import: keep OpenRouter optional for non-sweep commands
+    from spiritbox import audiocheck, dedup, transcribe  # local import: keep OpenRouter optional for non-sweep commands
+
+    dup_detector = dedup.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
 
     def _transcribe_and_report(wav_bytes: bytes, label: str, index: int) -> None:
         if on_transcript is None:
@@ -435,10 +443,13 @@ def sweep(
                 passed, _reason, stats = audiocheck.is_worth_transcribing(
                     pcm_bytes, AUDIO_RATE_HZ, silence_dbfs=silence_dbfs, max_flatness=max_flatness
                 )
+                is_dup = dup_detector.check(pcm_bytes) if dup_detector is not None else False
+                stats["duplicate"] = is_dup
+                transcribe_this = passed and not is_dup
                 if on_profile is not None:
-                    on_profile(label, index, stats, passed)
+                    on_profile(label, index, stats, transcribe_this)
 
-                if gate and not passed:
+                if (gate and not passed) or (dedup and is_dup):
                     index += 1
                     continue
 
@@ -457,6 +468,7 @@ class _BufferedChunk:
     label: str
     pcm: bytes
     t_end: float
+    is_duplicate: bool = False
 
 
 class ScrubSession:
@@ -466,6 +478,11 @@ class ScrubSession:
     decides what's worth sending to the API, not a statistical gate. This
     also means chunks can be much shorter (faster perceived hopping)
     without driving up API cost, since most hops are never transcribed.
+
+    When `dedup` is True, each chunk is checked against recent chunks (see
+    dedup.py) -- some stream relays intermittently loop a short segment
+    instead of true live audio. Flagged chunks still play live (the user
+    heard it happen regardless) but are excluded from mark()'s audio.
     """
 
     def __init__(
@@ -476,8 +493,11 @@ class ScrubSession:
         volume: int = DEFAULT_VOLUME,
         source: str = "sdr",
         buffer_seconds: float = 60.0,
+        dedup: bool = True,
+        dedup_window_seconds: float = 120.0,
         on_chunk: Callable[[str, int], None] | None = None,
         on_transcript: Callable[[str, str], None] | None = None,
+        on_profile: Callable[[str, int, bool], None] | None = None,
     ) -> None:
         if is_running() is not None:
             raise RuntimeError("live monitor is running -- run stop first")
@@ -487,6 +507,7 @@ class ScrubSession:
         self._buffer_seconds = buffer_seconds
         self._on_chunk = on_chunk
         self._on_transcript = on_transcript
+        self._on_profile = on_profile
 
         self._buffer: deque[_BufferedChunk] = deque()
         self._buffer_lock = threading.Lock()
@@ -495,9 +516,11 @@ class ScrubSession:
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._index = 0
 
-        from spiritbox import transcribe  # local import: keep OpenRouter optional for non-scrub commands
+        from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-scrub commands
+        from spiritbox import transcribe
 
         self._transcribe = transcribe
+        self._dup_detector = dedup_module.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
 
         self._player = subprocess.Popen(
             [
@@ -530,9 +553,12 @@ class ScrubSession:
 
             pcm = _capture_chunk(cmd, chunk_bytes_target, self._player.stdin, max_chunk_wait)
             t_end = time.time()
+            is_dup = self._dup_detector.check(pcm) if self._dup_detector is not None else False
+            if self._on_profile is not None:
+                self._on_profile(label, self._index, is_dup)
 
             with self._buffer_lock:
-                self._buffer.append(_BufferedChunk(label=label, pcm=pcm, t_end=t_end))
+                self._buffer.append(_BufferedChunk(label=label, pcm=pcm, t_end=t_end, is_duplicate=is_dup))
                 cutoff = t_end - self._buffer_seconds
                 while self._buffer and self._buffer[0].t_end < cutoff:
                     self._buffer.popleft()
@@ -550,6 +576,13 @@ class ScrubSession:
             if self._on_transcript is not None:
                 self._on_transcript("(nothing buffered yet)", "")
             return
+
+        clean_chunks = [c for c in chunks if not c.is_duplicate]
+        if not clean_chunks:
+            if self._on_transcript is not None:
+                self._on_transcript("(skipped: buffered audio was all duplicate/looping)", "")
+            return
+        chunks = clean_chunks
 
         pcm = b"".join(c.pcm for c in chunks)
         target_bytes = int(window_seconds * AUDIO_RATE_HZ * 2)

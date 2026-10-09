@@ -120,6 +120,10 @@ def sweep(
     max_flatness: float = typer.Option(
         0.45, "--max-flatness", help="Chunks with spectral flatness above this are treated as static (0=tonal, 1=flat noise)"
     ),
+    dedup: bool = typer.Option(
+        True, "--dedup/--no-dedup", help="Skip chunks that exactly repeat recent audio (a looping stream relay)"
+    ),
+    dedup_window: float = typer.Option(120.0, "--dedup-window", help="How far back (seconds) to check for repeated chunks"),
     debug_stats: bool = typer.Option(
         False, "--debug-stats", "-D", help="Print the audio profile stats for every chunk, to help tune thresholds"
     ),
@@ -145,12 +149,14 @@ def sweep(
     def on_profile(label: str, index: int, stats: dict, passed: bool) -> None:
         if debug_stats:
             verdict = "pass" if passed else "skip"
+            dup_flag = " dup" if stats.get("duplicate") else ""
             typer.echo(
                 f"[{index}] {label}: dbfs={stats['rms_dbfs']:6.1f} flatness={stats['flatness']:.2f} "
-                f"zcr={stats['zcr']:.2f} -> {verdict}"
+                f"zcr={stats['zcr']:.2f}{dup_flag} -> {verdict}"
             )
-        elif gate and not passed:
-            typer.echo(f"[{index}] {label}: skipped (dead air/static)")
+        elif not passed:
+            reason = "duplicate/looping audio" if stats.get("duplicate") else "dead air/static"
+            typer.echo(f"[{index}] {label}: skipped ({reason})")
 
     if source == "sdr" and not runtime.load_hotspots():
         typer.echo("no saved hotspots -- run 'spiritbox scan' first for better odds of real text")
@@ -168,6 +174,8 @@ def sweep(
             gate=gate,
             silence_dbfs=silence_dbfs,
             max_flatness=max_flatness,
+            dedup=dedup,
+            dedup_window_seconds=dedup_window,
             source=source,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
@@ -207,6 +215,10 @@ def scrub(
     ),
     mark_seconds: float = typer.Option(5.0, "--mark-seconds", "-m", help="Trailing seconds of audio a mark captures"),
     buffer_seconds: float = typer.Option(60.0, "--buffer-seconds", help="How much audio history stays available to mark"),
+    dedup: bool = typer.Option(
+        True, "--dedup/--no-dedup", help="Exclude chunks that exactly repeat recent audio (a looping stream relay) from marks"
+    ),
+    dedup_window: float = typer.Option(120.0, "--dedup-window", help="How far back (seconds) to check for repeated chunks"),
 ) -> None:
     """Continuously sweep and play live without auto-transcribing.
 
@@ -230,6 +242,10 @@ def scrub(
     def on_transcript(label_summary: str, text: str) -> None:
         typer.echo(f"\n>> {label_summary}: {text!r}")
 
+    def on_profile(label: str, index: int, is_duplicate: bool) -> None:
+        if is_duplicate:
+            typer.echo(f"\n[dup] {label} (hop {index}) repeated recent audio -- excluded from marks")
+
     try:
         session = runtime.ScrubSession(
             chunk_seconds=chunk_seconds,
@@ -238,8 +254,11 @@ def scrub(
             volume=volume,
             source=source,
             buffer_seconds=buffer_seconds,
+            dedup=dedup,
+            dedup_window_seconds=dedup_window,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
+            on_profile=on_profile,
         )
     except (RuntimeError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
