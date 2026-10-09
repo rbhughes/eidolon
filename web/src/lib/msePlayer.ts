@@ -14,6 +14,18 @@
 // path. Always check isSupported() and fall back to direct-URL playback
 // (accepting the playback/capture sync tradeoff that motivated this
 // class) rather than assume MSE+mp3 works.
+//
+// Even where MSE+mp3 *is* supported (Chromium), it's fragile against any
+// single corrupted/malformed chunk from a live network source -- measured
+// (via a headless-Chromium/CDP repro, no manual browser needed) a station
+// connection that had been running cleanly for 40+ seconds suddenly
+// deliver one garbage chunk (literal `ff ff ff ff...`, not a real MP3
+// frame), which Chrome's demuxer treated as fatal and unrecoverable
+// (CHUNK_DEMUXER_ERROR_APPEND_FAILED), permanently killing that
+// SourceBuffer. Regular `<audio src>` playback tolerates stream hiccups
+// far better via a different code path. There's no fixing this at the
+// append level -- hasFailed()/onSourceBufferError() below exist because
+// this WILL happen occasionally, not as a hedge against a bug.
 export class MsePlayer {
   static isSupported(): boolean {
     return (
@@ -40,6 +52,11 @@ export class MsePlayer {
   attach(audio: HTMLAudioElement): void {
     this.audio = audio;
     audio.src = URL.createObjectURL(this.mediaSource);
+
+    // A fatal decode error surfaces here (not as a thrown exception) --
+    // log it so a real failure in the field is diagnosable, not silent.
+    audio.addEventListener('error', () => this.onSourceBufferError(audio.error));
+
     this.mediaSource.addEventListener('sourceopen', () => {
       try {
         this.sourceBuffer = this.mediaSource.addSourceBuffer('audio/mpeg');
@@ -119,7 +136,8 @@ export class MsePlayer {
 
   private onSourceBufferError(err: unknown): void {
     if (this.failed) return;
-    console.error('[msePlayer] SourceBuffer error, falling back to direct-URL playback:', err);
+    const detail = err instanceof MediaError ? `code=${err.code} ${err.message}` : err;
+    console.error('[msePlayer] fatal SourceBuffer/decode error, falling back to direct-URL playback:', detail);
     this.failed = true;
     this.queue = [];
   }

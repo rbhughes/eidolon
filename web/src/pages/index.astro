@@ -79,8 +79,10 @@
 				buffer.recordHop(current.id, current.name);
 
 				// Re-checked every hop, not just once: a real SourceBuffer
-				// error can surface mid-session (measured on Chromium), after
-				// which hasFailed() flips true and we need to switch over.
+				// error can surface mid-session (a single corrupted chunk from
+				// a live station connection is enough -- see msePlayer.ts),
+				// after which hasFailed() flips true and we need to switch
+				// over to direct-URL playback for the rest of the session.
 				if (msePlayer && !msePlayer.hasFailed()) {
 					msePlayer.cutover();
 				} else {
