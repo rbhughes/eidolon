@@ -37,10 +37,12 @@ auto-transcribing anything. Press SPACE to send everything heard since
 the *last* mark (or since start, for the first one) to OpenRouter -- not
 just a fixed trailing window, so nothing said between two marks is lost
 -- capped at `--max-mark-seconds` (default 60s) in case you wait a while
-before marking. `q` quits, and `--show-transcript` reprints every marked
-segment in order (with timestamps) before exiting. Because nothing is
-sent automatically, hops can be short (default 1.5s) without driving up
-API cost -- in practice per-hop subprocess/connection overhead caps
+before marking. `q` quits; Ctrl+C does too, but first marks whatever's
+been buffered since the last mark (so you don't lose the tail end).
+`--show-transcript` (on by default) reprints every marked segment in
+order, with timestamps, before exiting. Because nothing is sent
+automatically, hops can be short (default 1.5s) without driving up API
+cost -- in practice per-hop subprocess/connection overhead caps
 real-world speed around 2-3s/hop regardless, well short of a hardware
 ghost box's rapid tuner-based switching. Needs an interactive terminal
 (reads raw keypresses from stdin).

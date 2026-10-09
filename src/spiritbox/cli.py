@@ -145,7 +145,10 @@ def sweep(
         True, "--translate/--no-translate", help="Translate non-English transcripts to English via a second LLM call"
     ),
     show_transcript: bool = typer.Option(
-        False, "--show-transcript", help="Print every marked segment again, in order, when you quit"
+        True,
+        "--show-transcript/--no-show-transcript",
+        help="Print every marked segment again, in order, when you quit. "
+        "If on, Ctrl+C also marks whatever's buffered before quitting.",
     ),
 ) -> None:
     """Hop across an audio source, playing live, with manual mark-to-transcribe.
@@ -224,7 +227,9 @@ def sweep(
             elif ch in ("q", "Q"):
                 break
     except KeyboardInterrupt:
-        pass
+        if show_transcript:
+            typer.echo("\n[ctrl+c: marking final audio]")
+            session.mark(max_window_seconds=max_mark_seconds)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         typer.echo("\nstopping...")
