@@ -124,6 +124,9 @@ def sweep(
         True, "--dedup/--no-dedup", help="Skip chunks that exactly repeat recent audio (a looping stream relay)"
     ),
     dedup_window: float = typer.Option(120.0, "--dedup-window", help="How far back (seconds) to check for repeated chunks"),
+    translate: bool = typer.Option(
+        True, "--translate/--no-translate", help="Translate non-English transcripts to English via a second LLM call"
+    ),
     debug_stats: bool = typer.Option(
         False, "--debug-stats", "-D", help="Print the audio profile stats for every chunk, to help tune thresholds"
     ),
@@ -176,6 +179,7 @@ def sweep(
             max_flatness=max_flatness,
             dedup=dedup,
             dedup_window_seconds=dedup_window,
+            translate=translate,
             source=source,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
@@ -219,6 +223,9 @@ def scrub(
         True, "--dedup/--no-dedup", help="Exclude chunks that exactly repeat recent audio (a looping stream relay) from marks"
     ),
     dedup_window: float = typer.Option(120.0, "--dedup-window", help="How far back (seconds) to check for repeated chunks"),
+    translate: bool = typer.Option(
+        True, "--translate/--no-translate", help="Translate non-English transcripts to English via a second LLM call"
+    ),
 ) -> None:
     """Continuously sweep and play live without auto-transcribing.
 
@@ -256,6 +263,7 @@ def scrub(
             buffer_seconds=buffer_seconds,
             dedup=dedup,
             dedup_window_seconds=dedup_window,
+            translate=translate,
             on_chunk=on_chunk,
             on_transcript=on_transcript,
             on_profile=on_profile,

@@ -40,6 +40,12 @@ relays intermittently loop a short segment instead of true live audio
 (`--dedup`/`--no-dedup`, `--dedup-window`). `scrub` applies the same check
 to exclude repeated chunks from what gets sent when you mark.
 
+Non-English transcripts (e.g. a foreign-language station) are translated
+to English via a second, cheap LLM call before being reported
+(`--translate`/`--no-translate` on both `sweep` and `scrub`). If
+translation fails, the original transcript is kept with a note appended
+rather than being dropped.
+
 `scrub` is the faster, more "ghost box"-like mode: it hops and plays
 continuously without auto-transcribing anything. Press SPACE to send the
 last few seconds to OpenRouter, `q` to quit. Because nothing is sent
@@ -58,4 +64,6 @@ interactive terminal.
   relative selection weight -- bias toward talk/news stations over music
   ones, since music chunks reliably come back empty (nothing to
   transcribe, not a bug). Checked into the repo as a starting seed list;
-  edit freely to add your own.
+  edit freely to add your own. Includes Paranormalium, a Polish-language
+  paranormal/UFO/conspiracy talk station -- its output is auto-translated
+  to English (see `--translate` above).

@@ -358,6 +358,7 @@ def sweep(
     max_flatness: float = 0.45,
     dedup: bool = True,
     dedup_window_seconds: float = 120.0,
+    translate: bool = True,
     source: str = "sdr",
     on_chunk: Callable[[str, int], None] | None = None,
     on_transcript: Callable[[str, int, str], None] | None = None,
@@ -411,6 +412,7 @@ def sweep(
     assert player.stdin is not None
 
     from spiritbox import audiocheck, dedup, transcribe  # local import: keep OpenRouter optional for non-sweep commands
+    from spiritbox import translate as translate_module
 
     dup_detector = dedup.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
 
@@ -421,6 +423,12 @@ def sweep(
             text = transcribe.transcribe_wav(wav_bytes)
         except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
             text = f"[transcription failed: {exc}]"
+        else:
+            if translate and text.strip():
+                try:
+                    text = translate_module.translate_to_english(text)
+                except Exception as exc:  # noqa: BLE001 -- keep the original transcript if translation fails
+                    text = f"{text} [translation failed: {exc}]"
         on_transcript(label, index, text)
 
     # Stream sources need connection/buffering time beyond the raw chunk
@@ -495,6 +503,7 @@ class ScrubSession:
         buffer_seconds: float = 60.0,
         dedup: bool = True,
         dedup_window_seconds: float = 120.0,
+        translate: bool = True,
         on_chunk: Callable[[str, int], None] | None = None,
         on_transcript: Callable[[str, str], None] | None = None,
         on_profile: Callable[[str, int, bool], None] | None = None,
@@ -505,6 +514,7 @@ class ScrubSession:
         self._next_hop = _make_hop_picker(source, band, hotspot_bias)
         self._chunk_seconds = chunk_seconds
         self._buffer_seconds = buffer_seconds
+        self._translate = translate
         self._on_chunk = on_chunk
         self._on_transcript = on_transcript
         self._on_profile = on_profile
@@ -518,8 +528,10 @@ class ScrubSession:
 
         from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-scrub commands
         from spiritbox import transcribe
+        from spiritbox import translate as translate_module
 
         self._transcribe = transcribe
+        self._translate_module = translate_module
         self._dup_detector = dedup_module.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
 
         self._player = subprocess.Popen(
@@ -604,6 +616,12 @@ class ScrubSession:
             text = self._transcribe.transcribe_wav(wav_bytes)
         except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
             text = f"[transcription failed: {exc}]"
+        else:
+            if self._translate and text.strip():
+                try:
+                    text = self._translate_module.translate_to_english(text)
+                except Exception as exc:  # noqa: BLE001 -- keep the original transcript if translation fails
+                    text = f"{text} [translation failed: {exc}]"
         self._on_transcript(label_summary, text)
 
     def stop(self) -> None:

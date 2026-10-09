@@ -1,5 +1,6 @@
 [
   {"name": "BBC World Service", "url": "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service", "weight": 4},
-  {"name": "WBUR", "url": "https://icecast-stream.wbur.org/wbur.aac", "weight": 4},
-  {"name": "WCPE Classical", "url": "https://audio-mp3.ibiblio.org/wcpe.mp3", "weight": 1}
+  {"name": "WBUR", "url": "https://icecast-stream.wbur.org/wbur.aac", "weight": 1},
+  {"name": "WCPE Classical", "url": "https://audio-mp3.ibiblio.org/wcpe.mp3", "weight": 1},
+  {"name": "Paranormalium", "url": "http://shoutcast.paranormalium.pl:8000/1", "weight": 3}
 ]
