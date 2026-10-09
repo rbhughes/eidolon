@@ -145,8 +145,8 @@ def load_hotspots() -> list[dict]:
 def _make_hop_picker(source: str, band: tuple[float, float], hotspot_bias: float) -> Callable[[], tuple[str, list[str]]]:
     """Build a closure that picks the next hop's (label, capture command).
 
-    Shared by sweep() and ScrubSession so both sources (SDR frequencies,
-    internet radio stations) are only implemented once.
+    Used by SweepSession so both sources (SDR frequencies, internet radio
+    stations) are only implemented once.
     """
     if source not in ("sdr", "stream"):
         raise ValueError(f"unknown source: {source!r} (expected 'sdr' or 'stream')")
@@ -348,130 +348,6 @@ def record(path: Path, seconds: float, freq: str = DEFAULT_FREQ) -> Path:
     return path
 
 
-def sweep(
-    chunk_seconds: float = 3.0,
-    band: tuple[float, float] = (88.0e6, 108.0e6),
-    hotspot_bias: float = 0.6,
-    volume: int = DEFAULT_VOLUME,
-    total_seconds: float | None = None,
-    gate: bool = True,
-    silence_dbfs: float = -50.0,
-    max_flatness: float = 0.45,
-    dedup: bool = True,
-    dedup_window_seconds: float = 120.0,
-    translate: bool = True,
-    source: str = "sdr",
-    on_chunk: Callable[[str, int], None] | None = None,
-    on_transcript: Callable[[str, int, str], None] | None = None,
-    on_profile: Callable[[str, int, dict, bool], None] | None = None,
-    stop_event: threading.Event | None = None,
-) -> None:
-    """Hop across audio sources, playing each chunk live and transcribing it
-    in the background so the next hop doesn't wait on the API response.
-
-    `source` selects where chunks come from:
-    - "sdr" (default): hops across `band` on the real FM channel grid, not
-      arbitrary frequencies. If hotspots have been found via scan(), a
-      hotspot_bias fraction of hops land on one of them (actual stations);
-      the rest are fully random valid channels (static/other signals).
-    - "stream": hops across the internet radio stations listed in
-      streams.json (see load_streams()) instead of using the RTL-SDR --
-      a non-hardware fallback, and talk/news stations give a much higher
-      speech hit rate than music-heavy FM.
-
-    When `gate` is True, each chunk is statistically profiled (see
-    audiocheck.py) before being sent for transcription -- dead air and
-    static are skipped without spending an API call. When `dedup` is True,
-    each chunk is also checked against recent chunks (see dedup.py) --
-    some stream relays intermittently loop a short segment instead of
-    true live audio, and an exact repeat is skipped the same way. Either
-    check can make `passed` False; `on_profile`, if set, is always called
-    with the computed stats (including a "duplicate" key) regardless of
-    pass/fail, for calibration/debugging.
-    """
-    if is_running() is not None:
-        raise RuntimeError("live monitor is running -- run stop first")
-
-    next_hop = _make_hop_picker(source, band, hotspot_bias)
-    stop_event = stop_event or threading.Event()
-    bytes_per_second = AUDIO_RATE_HZ * 2  # 16-bit mono
-    chunk_bytes_target = int(bytes_per_second * chunk_seconds)
-
-    player = subprocess.Popen(
-        [
-            "paplay",
-            "--raw",
-            f"--rate={AUDIO_RATE_HZ}",
-            "--format=s16le",
-            "--channels=1",
-            "--client-name=spiritbox-sweep",
-            f"--volume={volume}",
-        ],
-        stdin=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    assert player.stdin is not None
-
-    from spiritbox import audiocheck, dedup, transcribe  # local import: keep OpenRouter optional for non-sweep commands
-    from spiritbox import translate as translate_module
-
-    dup_detector = dedup.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
-
-    def _transcribe_and_report(wav_bytes: bytes, label: str, index: int) -> None:
-        if on_transcript is None:
-            return
-        try:
-            text = transcribe.transcribe_wav(wav_bytes)
-        except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
-            text = f"[transcription failed: {exc}]"
-        else:
-            if translate and text.strip():
-                try:
-                    text = translate_module.translate_to_english(text)
-                except Exception as exc:  # noqa: BLE001 -- keep the original transcript if translation fails
-                    text = f"{text} [translation failed: {exc}]"
-        on_transcript(label, index, text)
-
-    # Stream sources need connection/buffering time beyond the raw chunk
-    # duration; this bounds worst-case hang if a station stalls.
-    max_chunk_wait = chunk_seconds + 5.0
-
-    index = 0
-    start_time = time.time()
-    try:
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            while not stop_event.is_set():
-                if total_seconds is not None and time.time() - start_time >= total_seconds:
-                    break
-
-                label, cmd = next_hop()
-                if on_chunk is not None:
-                    on_chunk(label, index)
-
-                pcm_bytes = _capture_chunk(cmd, chunk_bytes_target, player.stdin, max_chunk_wait)
-                passed, _reason, stats = audiocheck.is_worth_transcribing(
-                    pcm_bytes, AUDIO_RATE_HZ, silence_dbfs=silence_dbfs, max_flatness=max_flatness
-                )
-                is_dup = dup_detector.check(pcm_bytes) if dup_detector is not None else False
-                stats["duplicate"] = is_dup
-                transcribe_this = passed and not is_dup
-                if on_profile is not None:
-                    on_profile(label, index, stats, transcribe_this)
-
-                if (gate and not passed) or (dedup and is_dup):
-                    index += 1
-                    continue
-
-                executor.submit(_transcribe_and_report, _pcm_to_wav_bytes(pcm_bytes), label, index)
-                index += 1
-    finally:
-        try:
-            player.stdin.close()
-        except OSError:
-            pass
-        _terminate(player.pid)
-
-
 @dataclass
 class _BufferedChunk:
     label: str
@@ -484,13 +360,13 @@ def _fmt_clock(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds).strftime("%H:%M:%S")
 
 
-class ScrubSession:
-    """Continuously hops and plays live, like sweep(), but does NOT
-    auto-transcribe every chunk. Instead it keeps a rolling buffer so the
-    caller can mark() a recent stretch of audio on demand -- the user's ear
-    decides what's worth sending to the API, not a statistical gate. This
-    also means chunks can be much shorter (faster perceived hopping)
-    without driving up API cost, since most hops are never transcribed.
+class SweepSession:
+    """Continuously hops and plays audio live without auto-transcribing
+    every chunk. Instead it keeps a rolling buffer so the caller can
+    mark() a recent stretch of audio on demand -- the user's ear decides
+    what's worth sending to the API, not a statistical gate. This also
+    means chunks can be much shorter (faster perceived hopping) without
+    driving up API cost, since most hops are never transcribed.
 
     When `dedup` is True, each chunk is checked against recent chunks (see
     dedup.py) -- some stream relays intermittently loop a short segment
@@ -541,7 +417,7 @@ class ScrubSession:
         self._history: list[tuple[str, str, str]] = []
         self._history_lock = threading.Lock()
 
-        from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-scrub commands
+        from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-sweep commands
         from spiritbox import transcribe
         from spiritbox import translate as translate_module
 
@@ -556,7 +432,7 @@ class ScrubSession:
                 f"--rate={AUDIO_RATE_HZ}",
                 "--format=s16le",
                 "--channels=1",
-                "--client-name=spiritbox-scrub",
+                "--client-name=spiritbox-sweep",
                 f"--volume={volume}",
             ],
             stdin=subprocess.PIPE,

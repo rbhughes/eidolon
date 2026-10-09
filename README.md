@@ -25,46 +25,46 @@ which doesn't export every symbol `pyrtlsdr` expects at import time.
 uv run spiritbox check                      # verify the RTL-SDR tools/dongle are usable
 uv run spiritbox start -f 100.0M             # live-listen (antenna testing)
 uv run spiritbox record -s 10 -o out.wav     # record a fixed-duration clip
-uv run spiritbox scan                        # find local FM stations -> .run/hotspots.json
-uv run spiritbox sweep                       # hop + transcribe, SDR source (default)
-uv run spiritbox sweep --source stream       # hop + transcribe, internet radio source
+uv run spiritbox scan                        # SDR only: find local FM stations -> .run/hotspots.json
+uv run spiritbox sweep                       # hop + live play, manual mark-to-transcribe, SDR source (default)
+uv run spiritbox sweep --source stream       # same, internet radio source
 uv run spiritbox streams                     # list configured internet radio stations
-uv run spiritbox scrub                       # fast hop + live play, manual mark-to-transcribe
 uv run spiritbox --help
 ```
 
-`sweep` statistically gates out dead air and static before spending an API
-call on transcription (see `--debug-stats` to inspect/tune thresholds). It
-also skips chunks that exactly repeat recent audio -- some internet radio
-relays intermittently loop a short segment instead of true live audio
-(`--dedup`/`--no-dedup`, `--dedup-window`). `scrub` applies the same check
-to exclude repeated chunks from what gets sent when you mark.
+`sweep` hops across an audio source and plays each chunk live without
+auto-transcribing anything. Press SPACE to send everything heard since
+the *last* mark (or since start, for the first one) to OpenRouter -- not
+just a fixed trailing window, so nothing said between two marks is lost
+-- capped at `--max-mark-seconds` (default 60s) in case you wait a while
+before marking. `q` quits, and `--show-transcript` reprints every marked
+segment in order (with timestamps) before exiting. Because nothing is
+sent automatically, hops can be short (default 1.5s) without driving up
+API cost -- in practice per-hop subprocess/connection overhead caps
+real-world speed around 2-3s/hop regardless, well short of a hardware
+ghost box's rapid tuner-based switching. Needs an interactive terminal
+(reads raw keypresses from stdin).
+
+`sweep` also skips chunks that exactly repeat recent audio from what
+gets sent when you mark -- some internet radio relays intermittently
+loop a short segment instead of true live audio (`--dedup`/`--no-dedup`,
+`--dedup-window`).
 
 Non-English transcripts (e.g. a foreign-language station) are translated
 to English via a second, cheap LLM call before being reported
-(`--translate`/`--no-translate` on both `sweep` and `scrub`). If
-translation fails, the original transcript is kept with a note appended
-rather than being dropped.
+(`--translate`/`--no-translate`). If translation fails, the original
+transcript is kept with a note appended rather than being dropped.
 
-`scrub` is the faster, more "ghost box"-like mode: it hops and plays
-continuously without auto-transcribing anything. Press SPACE to send
-everything heard since the *last* mark (or since start, for the first
-one) to OpenRouter -- not just a fixed trailing window, so nothing said
-between two marks is lost -- capped at `--max-mark-seconds` (default 60s)
-in case you wait a while before marking. `q` quits, and `--show-transcript`
-reprints every marked segment in order (with timestamps) before exiting.
-Because nothing is sent automatically, hops can be much shorter (default
-1.5s vs sweep's 3s) -- in practice per-hop subprocess/connection overhead
-caps real-world speed around 2-3s/hop either way, well short of a
-hardware ghost box's rapid tuner-based switching, but noticeably snappier
-than `sweep`. Needs an interactive terminal.
+`scan` is SDR-only (sweeps real RF frequencies via `rtl_power`) and has
+no effect on `sweep --source stream`, which picks from `streams.json`
+instead and never reads `scan`'s `.run/hotspots.json`.
 
 ## Configuration
 
 - `OPENROUTER_API_KEY` -- required for transcription; set in your
   environment or a local, gitignored `.env`.
 - `streams.json` -- list of `{"name", "url", "weight"}` internet radio
-  stations for `sweep --source stream`/`scrub`. `weight` (default 1) is a
+  stations for `sweep --source stream`. `weight` (default 1) is a
   relative selection weight -- bias toward talk/news stations over music
   ones, since music chunks reliably come back empty (nothing to
   transcribe, not a bug). Checked into the repo as a starting seed list;
