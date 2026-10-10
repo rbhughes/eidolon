@@ -7,7 +7,10 @@
 //    listeners), so reconnecting every few seconds repeatedly re-injects
 //    several seconds of bonus audio -- measured ~3.5x real-time inflation.
 //    Fix: open each station's connection once, at tune-in, and never
-//    reconnect it; discard each station's own first ~2s of bytes.
+//    reconnect it (api/stream.ts now does its OWN reconnection on a
+//    dropped upstream, with the burst-discard applied server-side on
+//    every reconnect -- see that file's header comment; this class no
+//    longer needs to know or care that a reconnect ever happened).
 //
 // 2. Opening those 9 persistent connections AS 9 SEPARATE fetches from the
 //    browser is *also* wrong -- browsers cap concurrent HTTP/1.1
@@ -27,12 +30,12 @@
 //    reset the lag, so audible output silently ran behind true live
 //    indefinitely. Fix: playback has no connection of its own at all --
 //    see bufferedPlayer.ts, fed via setOnLiveChunk() below with the exact
-//    same post-burst-discard bytes capture reads. Anything audible has,
-//    by construction, already been sitting in this buffer.
+//    same already-clean bytes capture reads. Anything audible has, by
+//    construction, already been sitting in this buffer.
 //
 // A hop-event timeline lets since() reconstruct which station was
 // actually current during each slice of a requested window, then pulls
-// only that slice from that station's own (un-bursted) buffer.
+// only that slice from that station's own buffer.
 export interface Station {
   id: string;
   name: string;
@@ -56,8 +59,6 @@ export interface CapturedChunk {
 }
 
 export class StationBuffer {
-  private static readonly BURST_DISCARD_MS = 2_000;
-
   private perStation = new Map<string, RawChunk[]>();
   private controller: AbortController | null = null;
   private hopEvents: HopEvent[] = [];
@@ -127,7 +128,9 @@ export class StationBuffer {
 
   /** Reads the one multiplexed connection and splits frames back out to
    * each station's own buffer. Frame format (see api/stream.ts):
-   * [1 byte station index][4 bytes big-endian length][payload], repeating. */
+   * [1 byte station index][4 bytes big-endian length][payload], repeating.
+   * The server already discards each (re)connection's own burst, so
+   * every byte seen here is clean, already-live-aligned content. */
   private async demux(stations: Station[], signal: AbortSignal): Promise<void> {
     try {
       const res = await fetch('/api/stream', { signal });
@@ -135,7 +138,6 @@ export class StationBuffer {
       const reader = res.body.getReader();
 
       let buf = new Uint8Array(0);
-      const firstFrameAt = new Map<string, number>();
 
       while (!signal.aborted) {
         const { done, value } = await reader.read();
@@ -161,15 +163,6 @@ export class StationBuffer {
 
           const station = stations[stationIndex];
           if (!station) continue;
-
-          if (!firstFrameAt.has(station.id)) firstFrameAt.set(station.id, Date.now());
-          // Every station measured so far dumps a large pre-buffered
-          // "catch up" burst (tens to hundreds of KB) in the first
-          // ~0.5-1s after its own upstream connection opens, then settles
-          // to real time. Discard that burst rather than let it
-          // masquerade as "just heard" content -- a one-time cost at
-          // tune-in, since the connection is opened once, not per hop.
-          if (Date.now() - firstFrameAt.get(station.id)! < StationBuffer.BURST_DISCARD_MS) continue;
 
           const chunks = this.perStation.get(station.id)!;
           chunks.push({ bytes: payload, t: Date.now() });

@@ -14,45 +14,67 @@
 // StationBuffer has *already* received, tagged, and stored for the
 // current station (same burst-discarded data capture reads) -- fed via
 // StationBuffer.setOnLiveChunk(), gated the same way the old MSE design
-// was (only chunks for the current station, post-burst-discard). Each
-// chunk becomes one small Blob, played back to back as plain, complete,
-// short audio files -- not a live stream, so there's no MSE, no raw-
-// stream burst behavior, no codec fragility, and it works identically in
-// every browser. By construction, anything audible has already been
-// sitting in the capture buffer for at least the time it took to queue
-// it -- there's nothing left to desync from.
+// was (only chunks for the current station, post-burst-discard).
+//
+// Two earlier mistakes in how this class turned bytes into audible clips,
+// both measured, not assumed:
+//
+// 1. First version cut a new clip per raw network chunk (median ~1400
+//    bytes, ~88ms of audio) -- each one a full separate <audio> load/
+//    play cycle, audibly chopped and too short for a word.
+//
+// 2. Second version batched on a fixed 1200ms timer instead -- clips got
+//    long enough, but measured (via paused-state polling) only a ~36%
+//    audible duty cycle, with recurring silent gaps up to ~2s. Cause: a
+//    clip's actual playback duration is however much real audio it
+//    contains, which rarely lines up with the timer's fixed tick -- a
+//    clip would finish early, and nothing was queued yet because the
+//    next tick hadn't fired, so the player sat idle until it did.
+//
+// Fix: don't batch on a timer at all. Cut and play whatever's
+// accumulated the INSTANT the previous clip ends ('ended' event) or the
+// instant the first bytes arrive after being idle -- never wait for a
+// clock tick when there's audio ready to go. Each clip's length then
+// naturally tracks how much arrived during the previous clip's own
+// playback (since data arrives at ~1x real time), which self-stabilizes
+// into continuous, gapless-ish playback with no tuned constant at all.
+// The only unavoidable gaps are real ones: no data has arrived yet
+// (e.g., just after a hop, before the new station's next chunk lands).
 export class BufferedPlayer {
-  // If playback ever falls behind (clip setup overhead compounding, a
-  // network hiccup), drop older queued clips rather than let the delay
-  // between "buffered" and "audible" silently grow -- the delay must
-  // stay small and bounded, never drift.
-  private static readonly MAX_QUEUED = 2;
-
   private audio = new Audio();
-  private queue: Blob[] = [];
   private currentUrl: string | null = null;
+  private pending: Uint8Array[] = [];
+  private pendingBytes = 0;
   private playing = false;
 
   constructor() {
     this.audio.addEventListener('ended', () => this.playNext());
   }
 
-  /** Queue one newly-arrived chunk for the current station. */
+  /** Accumulate one newly-arrived chunk for the current station. If
+   * nothing is currently playing, start immediately with whatever's
+   * here rather than waiting for more. */
   feed(bytes: Uint8Array): void {
     if (bytes.length === 0) return;
-    this.queue.push(new Blob([bytes as BlobPart], { type: 'audio/mpeg' }));
-    while (this.queue.length > BufferedPlayer.MAX_QUEUED) this.queue.shift();
+    this.pending.push(bytes);
+    this.pendingBytes += bytes.length;
     if (!this.playing) this.playNext();
   }
 
-  /** Called on every hop: drop anything queued/playing from the
+  /** Called on every hop: drop anything pending/playing from the
    * previous station immediately, so there's never a backlog to play
    * through -- the next feed() (from the new current station) starts
    * fresh. */
   cutover(): void {
-    this.queue = [];
+    this.pending = [];
+    this.pendingBytes = 0;
     this.playing = false;
     this.audio.pause();
+    // Revoking the object URL while audio.src still points at it leaves
+    // a dangling reference -- the element can then throw an unhandled
+    // NotSupportedError trying to reload a URL that no longer resolves
+    // to anything. Clear src first, then revoke.
+    this.audio.removeAttribute('src');
     this.releaseCurrentUrl();
   }
 
@@ -61,13 +83,23 @@ export class BufferedPlayer {
   }
 
   private playNext(): void {
-    const blob = this.queue.shift();
     this.releaseCurrentUrl();
-    if (!blob) {
+    if (this.pendingBytes === 0) {
       this.playing = false;
       return;
     }
+
+    const combined = new Uint8Array(this.pendingBytes);
+    let offset = 0;
+    for (const b of this.pending) {
+      combined.set(b, offset);
+      offset += b.length;
+    }
+    this.pending = [];
+    this.pendingBytes = 0;
+
     this.playing = true;
+    const blob = new Blob([combined as BlobPart], { type: 'audio/mpeg' });
     this.currentUrl = URL.createObjectURL(blob);
     this.audio.src = this.currentUrl;
     this.audio.play().catch(() => {
