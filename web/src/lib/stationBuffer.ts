@@ -1,15 +1,27 @@
 // Browser-side only. Mirrors the CLI's ScrubSession ring buffer, but
-// learned the hard way that reconnecting a station's proxy fetch on every
-// hop is wrong: these Icecast/StreamTheWorld sources send a pre-buffered
-// "catch up" burst to every new connection (to smooth playback start for
-// real listeners), so reconnecting every few seconds repeatedly re-injects
-// several seconds of bonus audio -- measured ~3.5x real-time inflation.
+// learned two hard lessons about how to actually fetch the stations:
 //
-// Fix: open ONE persistent connection per station at tune-in and never
-// reconnect it. Each station's own buffer then genuinely advances in real
-// time. Hopping only changes which station is "current" for playback and
-// for what gets attributed to the listener at capture time -- it does
-// NOT touch any connection. A separate hop-event timeline lets capture()
+// 1. Reconnecting a station's proxy fetch on every hop is wrong: these
+//    Icecast/StreamTheWorld sources send a pre-buffered "catch up" burst
+//    to every new connection (to smooth playback start for real
+//    listeners), so reconnecting every few seconds repeatedly re-injects
+//    several seconds of bonus audio -- measured ~3.5x real-time inflation.
+//    Fix: open each station's connection once, at tune-in, and never
+//    reconnect it; discard each station's own first ~2s of bytes.
+//
+// 2. Opening those 9 persistent connections AS 9 SEPARATE fetches from the
+//    browser is *also* wrong -- browsers cap concurrent HTTP/1.1
+//    connections to one origin at 6. Held open forever, 3 of the 9 (and
+//    any other request to this origin, including the transcribe POST)
+//    queue behind the 6 live ones and never get dispatched -- reproduced
+//    headlessly, not guessed at (see api/stream.ts's header comment for
+//    the full story). Fix: one fetch to /api/stream, which multiplexes
+//    all 9 stations' bytes server-side and sends them down as a single
+//    framed byte stream; demux() below splits them back out client-side.
+//
+// Hopping only changes which station is "current" for playback and for
+// what gets attributed to the listener at capture time -- it does NOT
+// touch the connection. A separate hop-event timeline lets capture()
 // reconstruct which station was actually playing during each slice of
 // the requested window, then pulls only that slice from that station's
 // own (un-bursted) buffer.
@@ -39,7 +51,7 @@ export class StationBuffer {
   private static readonly BURST_DISCARD_MS = 2_000;
 
   private perStation = new Map<string, RawChunk[]>();
-  private controllers = new Map<string, AbortController>();
+  private controller: AbortController | null = null;
   private hopEvents: HopEvent[] = [];
   private readonly windowMs: number;
   private currentStationId: string | null = null;
@@ -57,20 +69,18 @@ export class StationBuffer {
     this.onLiveChunk = cb;
   }
 
-  /** Open one persistent connection per station. Call once at tune-in
-   * (and again after stop() if resuming from a hidden tab). */
+  /** Open the one multiplexed connection. Call once at tune-in (and
+   * again after stop() if resuming from a hidden tab). */
   start(stations: Station[]): void {
     this.stop();
-    for (const s of stations) {
-      const controller = new AbortController();
-      this.controllers.set(s.id, controller);
-      this.fillStation(s, controller.signal);
-    }
+    const controller = new AbortController();
+    this.controller = controller;
+    this.demux(stations, controller.signal);
   }
 
   stop(): void {
-    for (const controller of this.controllers.values()) controller.abort();
-    this.controllers.clear();
+    this.controller?.abort();
+    this.controller = null;
   }
 
   /** Record that `station` became the "current" one for playback, right now. */
@@ -107,30 +117,57 @@ export class StationBuffer {
     return out;
   }
 
-  private async fillStation(station: Station, signal: AbortSignal): Promise<void> {
+  /** Reads the one multiplexed connection and splits frames back out to
+   * each station's own buffer. Frame format (see api/stream.ts):
+   * [1 byte station index][4 bytes big-endian length][payload], repeating. */
+  private async demux(stations: Station[], signal: AbortSignal): Promise<void> {
     try {
-      const res = await fetch(`/api/stream?station=${encodeURIComponent(station.id)}`, { signal });
+      const res = await fetch('/api/stream', { signal });
       if (!res.body) return;
       const reader = res.body.getReader();
-      const chunks = this.perStation.get(station.id)!;
-      const connectedAt = Date.now();
+
+      let buf = new Uint8Array(0);
+      const firstFrameAt = new Map<string, number>();
+
       while (!signal.aborted) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value && value.length) {
+          const merged = new Uint8Array(buf.length + value.length);
+          merged.set(buf, 0);
+          merged.set(value, buf.length);
+          buf = merged;
+        }
+
+        // A read() can deliver a partial frame, several frames at once,
+        // or both -- drain every complete frame currently buffered and
+        // leave any trailing partial one for the next read().
+        while (buf.length >= 5) {
+          const view = new DataView(buf.buffer, buf.byteOffset, buf.length);
+          const stationIndex = view.getUint8(0);
+          const len = view.getUint32(1, false);
+          if (buf.length < 5 + len) break;
+
+          const payload = buf.slice(5, 5 + len);
+          buf = buf.slice(5 + len);
+
+          const station = stations[stationIndex];
+          if (!station) continue;
+
+          if (!firstFrameAt.has(station.id)) firstFrameAt.set(station.id, Date.now());
           // Every station measured so far dumps a large pre-buffered
-          // "catch up" burst (tens to hundreds of KB -- 50+ seconds'
-          // worth of real-time audio) in the first ~0.5-1s of a fresh
-          // connection, then settles to real time. Discard that burst
-          // rather than let it masquerade as "just heard" content. This
-          // only costs a one-time delay at tune-in, since connections
-          // are opened once now, not per hop.
-          if (Date.now() - connectedAt >= StationBuffer.BURST_DISCARD_MS) {
-            chunks.push({ bytes: value, t: Date.now() });
-            this.trim(chunks);
-            if (station.id === this.currentStationId && this.onLiveChunk) {
-              this.onLiveChunk(value);
-            }
+          // "catch up" burst (tens to hundreds of KB) in the first
+          // ~0.5-1s after its own upstream connection opens, then settles
+          // to real time. Discard that burst rather than let it
+          // masquerade as "just heard" content -- a one-time cost at
+          // tune-in, since the connection is opened once, not per hop.
+          if (Date.now() - firstFrameAt.get(station.id)! < StationBuffer.BURST_DISCARD_MS) continue;
+
+          const chunks = this.perStation.get(station.id)!;
+          chunks.push({ bytes: payload, t: Date.now() });
+          this.trim(chunks);
+          if (station.id === this.currentStationId && this.onLiveChunk) {
+            this.onLiveChunk(payload);
           }
         }
       }
