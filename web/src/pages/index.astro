@@ -37,11 +37,20 @@
 			const captureBtn = document.getElementById('capture') as HTMLButtonElement;
 			const log = document.getElementById('log') as HTMLDivElement;
 
-			// Matches the CLI's chunk_seconds default (1.5s per hop) -- short
-			// enough that a single hop is roughly word-sized, so capturing
-			// promptly after hearing something gives a single-fragment clip
-			// rather than several stations stitched together.
-			const HOP_MS = 1_500;
+			// Tried matching the CLI's chunk_seconds (1.5s) directly -- measured
+			// regression, not an improvement: "since last capture" means a
+			// capture after a long gap accumulates one segment per hop, and at
+			// 1.5s that's ~16-20 station/language switches in a 30s window.
+			// Voxtral can't produce anything coherent from that much rapid
+			// language-switching (confirmed: a 30s/9-language capture came back
+			// as 3 garbled sentences). The CLI doesn't hit this as hard in
+			// practice because marking promptly keeps "since last mark" short;
+			// a literal 1.5s hop rate here makes even a *patient* capture
+			// incoherent. 3000ms keeps enough same-station context per segment
+			// for transcription to work; the "capture promptly for a
+			// single-fragment clip" idea still holds at this rate too, it just
+			// isn't driven by making every hop globally faster.
+			const HOP_MS = 3_000;
 			const BUFFER_WINDOW_MS = 60_000;
 			const MAX_CAPTURE_MS = 60_000; // safety cap if you wait a while before capturing
 
