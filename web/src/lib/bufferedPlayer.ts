@@ -40,6 +40,34 @@
 // into continuous, gapless-ish playback with no tuned constant at all.
 // The only unavoidable gaps are real ones: no data has arrived yet
 // (e.g., just after a hop, before the new station's next chunk lands).
+//
+// 3. Measured in headless Chromium as mostly-continuous after (2), but
+//    the user reported real Firefox playback as extensive, non-periodic
+//    *silence* ("like someone hitting mute arbitrarily") rather than
+//    clicks/pops -- a different symptom than anything measured so far.
+//    Each clip is a Blob cut at whatever byte offset `pending` happened
+//    to end at, which is a raw network-read boundary, not an MP3 frame
+//    boundary -- there is no reason to expect it to line up with one.
+//    Chromium's decoder appears tolerant of a clip starting mid-frame
+//    (skips to the next sync word); this is a plausible, NOT yet
+//    independently confirmed explanation for Firefox producing silence
+//    for a clip instead -- Firefox's remote-debugging-port here doesn't
+//    implement Chrome's CDP discovery endpoints, so headless automation
+//    (the technique used for every other fix today) wasn't available to
+//    directly verify this in Firefox. Fixed anyway, since it's correct
+//    regardless of whether this is the exact Firefox mechanism: scan for
+//    the first valid MPEG frame sync word before cutting each clip, so
+//    every clip handed to <audio> starts at a real frame, never mid-one.
+function findFrameSync(buf: Uint8Array): number {
+  for (let i = 0; i < buf.length - 2; i++) {
+    if (buf[i] === 0xff && (buf[i + 1] & 0xe0) === 0xe0) {
+      const bitrateIndex = (buf[i + 2] >> 4) & 0x0f;
+      if (bitrateIndex !== 0x0f) return i; // 0b1111 is reserved/invalid -- not a real header
+    }
+  }
+  return -1;
+}
+
 export class BufferedPlayer {
   private audio = new Audio();
   private currentUrl: string | null = null;
@@ -98,8 +126,14 @@ export class BufferedPlayer {
     this.pending = [];
     this.pendingBytes = 0;
 
+    // Trim to the first real frame boundary -- discards at most a few
+    // dozen leading bytes (well under 1ms of audio), not worth carrying
+    // forward to the next clip.
+    const syncAt = findFrameSync(combined);
+    const aligned = syncAt > 0 ? combined.subarray(syncAt) : combined;
+
     this.playing = true;
-    const blob = new Blob([combined as BlobPart], { type: 'audio/mpeg' });
+    const blob = new Blob([aligned as BlobPart], { type: 'audio/mpeg' });
     this.currentUrl = URL.createObjectURL(blob);
     this.audio.src = this.currentUrl;
     this.audio.play().catch(() => {
