@@ -1,15 +1,19 @@
 import type { APIRoute } from 'astro';
+import { env } from 'cloudflare:workers';
 import { getSecret } from 'astro:env/server';
 import { transcribeMp3, translateToEnglish, OpenRouterError } from '../../lib/openrouter';
-
-// TODO before this is public: rate limit (per-IP and/or global budget).
-// A stateless Pages Function has no memory between requests, so this
-// needs a KV or Durable Object counter -- deliberately deferred until
-// the rest of the demo works locally.
+import { checkRateLimit, rateLimitedResponse } from '../../lib/rateLimit';
 
 const MAX_CLIP_BYTES = 2_000_000; // generous cap on a client-assembled clip
 
 export const POST: APIRoute = async ({ request }) => {
+  // Checked first, before touching the body -- this is the endpoint that
+  // actually costs money (OpenRouter calls), so the limit here is the one
+  // doing the real budget protection. See wrangler.jsonc for the bucket.
+  if (!(await checkRateLimit(env.RATE_LIMIT_TRANSCRIBE, request))) {
+    return rateLimitedResponse({ ok: false, error: 'rate limited, slow down' });
+  }
+
   let form: FormData;
   try {
     form = await request.formData();

@@ -5,6 +5,10 @@ dist/
 # local wrangler/miniflare dev runtime state (sqlite caches for KV/D1/R2/etc.)
 .wrangler/
 
+# generated from wrangler.jsonc + astro:env schema -- regenerate with
+# `npm run generate-types` after changing either
+worker-configuration.d.ts
+
 # dependencies
 node_modules/
 
