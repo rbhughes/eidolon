@@ -14,8 +14,6 @@
 			<h1>Eidolon</h1>
 			<p class="sub">a radio-static spirit box. hop through live stations, capture a few seconds, see what comes through.</p>
 
-			<audio id="player"></audio>
-
 			<div class="panel">
 				<div class="station" id="station">-- not tuned in --</div>
 				<div class="controls">
@@ -32,15 +30,18 @@
 		<script>
 			import { STATIONS, pickWeighted } from '../data/stations';
 			import { StationBuffer } from '../lib/stationBuffer';
-			import { MsePlayer } from '../lib/msePlayer';
+			import { StationAudioPool } from '../lib/audioPool';
 
-			const player = document.getElementById('player') as HTMLAudioElement;
 			const stationEl = document.getElementById('station') as HTMLDivElement;
 			const tuneBtn = document.getElementById('tune') as HTMLButtonElement;
 			const captureBtn = document.getElementById('capture') as HTMLButtonElement;
 			const log = document.getElementById('log') as HTMLDivElement;
 
-			const HOP_MS = 3000;
+			// Matches the CLI's chunk_seconds default (1.5s per hop) -- short
+			// enough that a single hop is roughly word-sized, so capturing
+			// promptly after hearing something gives a single-fragment clip
+			// rather than several stations stitched together.
+			const HOP_MS = 1_500;
 			const BUFFER_WINDOW_MS = 60_000;
 			const MAX_CAPTURE_MS = 60_000; // safety cap if you wait a while before capturing
 
@@ -50,24 +51,7 @@
 			let lastCaptureTime = Date.now();
 
 			const buffer = new StationBuffer(STATIONS, BUFFER_WINDOW_MS);
-
-			// MSE+raw-mp3 support is inconsistent across browsers (e.g. Firefox
-			// on Linux rejects it outright) -- when it's not usable, fall back
-			// to direct-URL playback (audio.src = station.url, reconnecting
-			// each hop) rather than go silent. Capture/translation accuracy is
-			// unaffected either way; only "does playback byte-match capture"
-			// degrades on the fallback path.
-			const mseSupported = MsePlayer.isSupported();
-			const msePlayer = mseSupported ? new MsePlayer() : null;
-			if (msePlayer) {
-				msePlayer.attach(player);
-				// Playback fed from the exact same real-time bytes the capture
-				// buffer records, so what you hear and what gets captured can
-				// never disagree.
-				buffer.setOnLiveChunk((bytes) => msePlayer.feed(bytes));
-			} else {
-				console.warn('[player] MSE+audio/mpeg unsupported here -- falling back to direct stream URLs per hop');
-			}
+			const audioPool = new StationAudioPool();
 
 			function renderStation() {
 				stationEl.textContent = current.name;
@@ -77,31 +61,13 @@
 				current = pickWeighted();
 				renderStation();
 				buffer.recordHop(current.id, current.name);
-
-				// Re-checked every hop, not just once: a real SourceBuffer
-				// error can surface mid-session (a single corrupted chunk from
-				// a live station connection is enough -- see msePlayer.ts),
-				// after which hasFailed() flips true and we need to switch
-				// over to direct-URL playback for the rest of the session.
-				if (msePlayer && !msePlayer.hasFailed()) {
-					msePlayer.cutover();
-				} else {
-					if (msePlayer) buffer.setOnLiveChunk(null); // stop feeding a dead MSE pipeline
-					player.src = current.url;
-					player.play().catch(() => {
-						/* ignore -- a hop mid-unlock race is harmless, next hop recovers */
-					});
-				}
+				audioPool.setCurrent(current.id);
 			}
 
 			function startHopping() {
 				buffer.start(STATIONS);
+				audioPool.start(STATIONS);
 				hop();
-				if (msePlayer) {
-					player.play().catch(() => {
-						/* ignore -- browser may need another user gesture; capture still works */
-					});
-				}
 				hopTimer = setInterval(hop, HOP_MS);
 			}
 
@@ -110,7 +76,7 @@
 					clearInterval(hopTimer);
 					hopTimer = null;
 				}
-				player.pause();
+				audioPool.stop();
 				buffer.stop();
 			}
 

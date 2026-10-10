@@ -19,12 +19,12 @@
 //    all 9 stations' bytes server-side and sends them down as a single
 //    framed byte stream; demux() below splits them back out client-side.
 //
-// Hopping only changes which station is "current" for playback and for
-// what gets attributed to the listener at capture time -- it does NOT
-// touch the connection. A separate hop-event timeline lets capture()
-// reconstruct which station was actually playing during each slice of
-// the requested window, then pulls only that slice from that station's
-// own (un-bursted) buffer.
+// Hopping only changes which station is attributed to the listener at
+// capture time -- it does NOT touch any connection (playback is a
+// separate concern, see audioPool.ts). A hop-event timeline lets
+// since() reconstruct which station was actually current during each
+// slice of the requested window, then pulls only that slice from that
+// station's own (un-bursted) buffer.
 export interface Station {
   id: string;
   name: string;
@@ -54,19 +54,10 @@ export class StationBuffer {
   private controller: AbortController | null = null;
   private hopEvents: HopEvent[] = [];
   private readonly windowMs: number;
-  private currentStationId: string | null = null;
-  private onLiveChunk: ((bytes: Uint8Array) => void) | null = null;
 
   constructor(stations: Station[], windowMs = 60_000) {
     this.windowMs = windowMs;
     for (const s of stations) this.perStation.set(s.id, []);
-  }
-
-  /** Bytes from whichever station is current, in real time, as they're
-   * buffered -- for feeding an MsePlayer so playback and capture are the
-   * exact same data. */
-  setOnLiveChunk(cb: ((bytes: Uint8Array) => void) | null): void {
-    this.onLiveChunk = cb;
   }
 
   /** Open the one multiplexed connection. Call once at tune-in (and
@@ -83,10 +74,9 @@ export class StationBuffer {
     this.controller = null;
   }
 
-  /** Record that `station` became the "current" one for playback, right now. */
+  /** Record that `station` became current, right now. */
   recordHop(stationId: string, stationName: string): void {
     const now = Date.now();
-    this.currentStationId = stationId;
     this.hopEvents.push({ t: now, stationId, stationName });
     const cutoff = now - this.windowMs;
     while (this.hopEvents.length > 1 && this.hopEvents[1].t < cutoff) {
@@ -166,9 +156,6 @@ export class StationBuffer {
           const chunks = this.perStation.get(station.id)!;
           chunks.push({ bytes: payload, t: Date.now() });
           this.trim(chunks);
-          if (station.id === this.currentStationId && this.onLiveChunk) {
-            this.onLiveChunk(payload);
-          }
         }
       }
     } catch {
