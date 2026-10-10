@@ -30,7 +30,7 @@
 		<script>
 			import { STATIONS, pickWeighted } from '../data/stations';
 			import { StationBuffer } from '../lib/stationBuffer';
-			import { StationAudioPool } from '../lib/audioPool';
+			import { BufferedPlayer } from '../lib/bufferedPlayer';
 
 			const stationEl = document.getElementById('station') as HTMLDivElement;
 			const tuneBtn = document.getElementById('tune') as HTMLButtonElement;
@@ -60,7 +60,12 @@
 			let lastCaptureTime = Date.now();
 
 			const buffer = new StationBuffer(STATIONS, BUFFER_WINDOW_MS);
-			const audioPool = new StationAudioPool();
+			const player = new BufferedPlayer();
+
+			// Playback has no connection of its own -- it only ever plays
+			// bytes the buffer has already received and stored for whichever
+			// station is current, so there's nothing left to desync from.
+			buffer.setOnLiveChunk((bytes) => player.feed(bytes));
 
 			function renderStation() {
 				stationEl.textContent = current.name;
@@ -70,12 +75,14 @@
 				current = pickWeighted();
 				renderStation();
 				buffer.recordHop(current.id, current.name);
-				audioPool.setCurrent(current.id);
+				// Drop anything queued/playing from the previous station so
+				// there's never a backlog to play through -- playback starts
+				// fresh from the new station's next arriving chunk.
+				player.cutover();
 			}
 
 			function startHopping() {
 				buffer.start(STATIONS);
-				audioPool.start(STATIONS);
 				hop();
 				hopTimer = setInterval(hop, HOP_MS);
 			}
@@ -85,7 +92,7 @@
 					clearInterval(hopTimer);
 					hopTimer = null;
 				}
-				audioPool.stop();
+				player.stop();
 				buffer.stop();
 			}
 

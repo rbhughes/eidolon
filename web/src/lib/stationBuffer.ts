@@ -1,5 +1,5 @@
 // Browser-side only. Mirrors the CLI's ScrubSession ring buffer, but
-// learned two hard lessons about how to actually fetch the stations:
+// learned several hard lessons about how to actually fetch the stations:
 //
 // 1. Reconnecting a station's proxy fetch on every hop is wrong: these
 //    Icecast/StreamTheWorld sources send a pre-buffered "catch up" burst
@@ -19,12 +19,20 @@
 //    all 9 stations' bytes server-side and sends them down as a single
 //    framed byte stream; demux() below splits them back out client-side.
 //
-// Hopping only changes which station is attributed to the listener at
-// capture time -- it does NOT touch any connection (playback is a
-// separate concern, see audioPool.ts). A hop-event timeline lets
-// since() reconstruct which station was actually current during each
-// slice of the requested window, then pulls only that slice from that
-// station's own (un-bursted) buffer.
+// 3. Giving playback its OWN connection (directly to each station, or via
+//    MSE fed from a live tap) is *also* wrong, no matter how carefully
+//    synced it seems: a second connection has no guaranteed relationship
+//    to this buffer's timeline, and a plain <audio src> never skips a
+//    station's burst -- it plays through it at 1x with nothing to ever
+//    reset the lag, so audible output silently ran behind true live
+//    indefinitely. Fix: playback has no connection of its own at all --
+//    see bufferedPlayer.ts, fed via setOnLiveChunk() below with the exact
+//    same post-burst-discard bytes capture reads. Anything audible has,
+//    by construction, already been sitting in this buffer.
+//
+// A hop-event timeline lets since() reconstruct which station was
+// actually current during each slice of a requested window, then pulls
+// only that slice from that station's own (un-bursted) buffer.
 export interface Station {
   id: string;
   name: string;
@@ -54,10 +62,19 @@ export class StationBuffer {
   private controller: AbortController | null = null;
   private hopEvents: HopEvent[] = [];
   private readonly windowMs: number;
+  private currentStationId: string | null = null;
+  private onLiveChunk: ((bytes: Uint8Array) => void) | null = null;
 
   constructor(stations: Station[], windowMs = 60_000) {
     this.windowMs = windowMs;
     for (const s of stations) this.perStation.set(s.id, []);
+  }
+
+  /** Bytes for whichever station is current, in real time, as they're
+   * buffered -- for feeding a BufferedPlayer so playback only ever plays
+   * what's already in this buffer. */
+  setOnLiveChunk(cb: ((bytes: Uint8Array) => void) | null): void {
+    this.onLiveChunk = cb;
   }
 
   /** Open the one multiplexed connection. Call once at tune-in (and
@@ -77,6 +94,7 @@ export class StationBuffer {
   /** Record that `station` became current, right now. */
   recordHop(stationId: string, stationName: string): void {
     const now = Date.now();
+    this.currentStationId = stationId;
     this.hopEvents.push({ t: now, stationId, stationName });
     const cutoff = now - this.windowMs;
     while (this.hopEvents.length > 1 && this.hopEvents[1].t < cutoff) {
@@ -156,6 +174,9 @@ export class StationBuffer {
           const chunks = this.perStation.get(station.id)!;
           chunks.push({ bytes: payload, t: Date.now() });
           this.trim(chunks);
+          if (station.id === this.currentStationId && this.onLiveChunk) {
+            this.onLiveChunk(payload);
+          }
         }
       }
     } catch {
