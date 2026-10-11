@@ -53,6 +53,20 @@ import { checkRateLimit, rateLimitedResponse } from '../../lib/rateLimit';
 const BURST_DISCARD_MS = 2_000;
 const RECONNECT_DELAY_MS = 1_500;
 
+// Hard cap on bytes queued for a client that isn't reading. The first
+// version enqueued unconditionally, ignoring backpressure: a client that
+// held the connection open but stopped reading (stalled tab, a client-side
+// read loop that died without cancelling) made the 9 upstream relays pile
+// bytes into the stream's queue forever. Measured ~22MB/min growth per
+// stalled client, never reclaimed -- left overnight it grew the local
+// workerd to 8GB and got it OOM-killed (and in production one such client
+// would blow the isolate's memory limit for everyone on it). Now the queue
+// is bounded by construction: once it's full the client is too far behind
+// to be "live" anyway, so the connection is terminated (and every upstream
+// fetch aborted) instead of buffering. The client reconnects on its own.
+// ~512KB is ~3.5s of all 9 stations at ~128kbps each.
+const MAX_QUEUED_BYTES = 512 * 1024;
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -65,69 +79,94 @@ export const GET: APIRoute = async ({ request }) => {
     return rateLimitedResponse({ error: 'rate limited, slow down' });
   }
 
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let closed = false;
-      const safeEnqueue = (frame: Uint8Array) => {
-        if (closed) return;
-        try {
-          controller.enqueue(frame);
-        } catch {
-          closed = true;
-        }
-      };
+  // Aborted when the client disconnects OR when we terminate a client
+  // that fell too far behind -- either way every upstream fetch stops.
+  const upstreamAbort = new AbortController();
+  request.signal.addEventListener('abort', () => upstreamAbort.abort(), { once: true });
+  const signal = upstreamAbort.signal;
 
-      async function relayStation(station: (typeof STATIONS)[number], index: number): Promise<void> {
-        while (!closed && !request.signal.aborted) {
-          let upstream: Response;
-          try {
-            upstream = await fetch(station.url, { signal: request.signal });
-          } catch {
-            if (request.signal.aborted) return;
-            await sleep(RECONNECT_DELAY_MS);
-            continue;
-          }
-          if (!upstream.ok || !upstream.body) {
-            await sleep(RECONNECT_DELAY_MS);
-            continue;
-          }
-
-          const reader = upstream.body.getReader();
-          const connectedAt = Date.now();
-          while (!closed && !request.signal.aborted) {
-            let result: ReadableStreamReadResult<Uint8Array>;
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      async start(controller) {
+        let closed = false;
+        const safeEnqueue = (frame: Uint8Array) => {
+          if (closed) return;
+          // desiredSize <= 0 means MAX_QUEUED_BYTES are already sitting
+          // unread -- drop the client rather than grow the queue.
+          if ((controller.desiredSize ?? 0) <= 0) {
+            closed = true;
+            upstreamAbort.abort();
             try {
-              result = await reader.read();
+              controller.error(new Error('client not keeping up with live stream'));
             } catch {
-              break; // aborted, or this connection dropped -- fall through to reconnect
+              // already closed/errored
             }
-            if (result.done) break; // this connection ended on its own -- reconnect below
-            const value = result.value;
-            if (!value || value.length === 0) continue;
-            if (Date.now() - connectedAt < BURST_DISCARD_MS) continue;
-
-            const frame = new Uint8Array(5 + value.length);
-            frame[0] = index;
-            new DataView(frame.buffer).setUint32(1, value.length, false);
-            frame.set(value, 5);
-            safeEnqueue(frame);
+            return;
           }
+          try {
+            controller.enqueue(frame);
+          } catch {
+            closed = true;
+            upstreamAbort.abort();
+          }
+        };
 
-          if (request.signal.aborted) return;
-          await sleep(RECONNECT_DELAY_MS);
+        async function relayStation(station: (typeof STATIONS)[number], index: number): Promise<void> {
+          while (!closed && !signal.aborted) {
+            let upstream: Response;
+            try {
+              upstream = await fetch(station.url, { signal });
+            } catch {
+              if (signal.aborted) return;
+              await sleep(RECONNECT_DELAY_MS);
+              continue;
+            }
+            if (!upstream.ok || !upstream.body) {
+              await sleep(RECONNECT_DELAY_MS);
+              continue;
+            }
+
+            const reader = upstream.body.getReader();
+            const connectedAt = Date.now();
+            while (!closed && !signal.aborted) {
+              let result: ReadableStreamReadResult<Uint8Array>;
+              try {
+                result = await reader.read();
+              } catch {
+                break; // aborted, or this connection dropped -- fall through to reconnect
+              }
+              if (result.done) break; // this connection ended on its own -- reconnect below
+              const value = result.value;
+              if (!value || value.length === 0) continue;
+              if (Date.now() - connectedAt < BURST_DISCARD_MS) continue;
+
+              const frame = new Uint8Array(5 + value.length);
+              frame[0] = index;
+              new DataView(frame.buffer).setUint32(1, value.length, false);
+              frame.set(value, 5);
+              safeEnqueue(frame);
+            }
+
+            if (signal.aborted) return;
+            await sleep(RECONNECT_DELAY_MS);
+          }
         }
-      }
 
-      await Promise.all(STATIONS.map((station, index) => relayStation(station, index)));
+        await Promise.all(STATIONS.map((station, index) => relayStation(station, index)));
 
-      closed = true;
-      try {
-        controller.close();
-      } catch {
-        // already closed/errored from the client side -- fine
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          // already closed/errored from the client side -- fine
+        }
+      },
+      cancel() {
+        upstreamAbort.abort();
       }
-    }
-  });
+    },
+    new ByteLengthQueuingStrategy({ highWaterMark: MAX_QUEUED_BYTES })
+  );
 
   return new Response(stream, {
     headers: {
