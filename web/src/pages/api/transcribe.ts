@@ -71,7 +71,13 @@ export const POST: APIRoute = async ({ request }) => {
     // to show all of it.
     const debug = {
       clipBytes: file.size,
-      transcription: { model: transcription.model, ms: transcription.ms, usage: transcription.usage, rawText: transcription.text },
+      transcription: {
+        model: transcription.model,
+        ms: transcription.ms,
+        attempts: transcription.attempts,
+        usage: transcription.usage,
+        rawText: transcription.text
+      },
       translation
     };
     return Response.json({ ok: true, text, timestamp: new Date().toISOString(), debug });

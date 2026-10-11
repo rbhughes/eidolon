@@ -568,7 +568,7 @@ const stationNames = STATIONS.map((s) => s.name);
 
 			interface ModelDebug {
 				clipBytes: number;
-				transcription: { model: string; ms: number; usage?: Record<string, unknown>; rawText: string };
+				transcription: { model: string; ms: number; attempts: number; usage?: Record<string, unknown>; rawText: string };
 				translation:
 					| null
 					| { error: string }
@@ -576,12 +576,17 @@ const stationNames = STATIONS.map((s) => s.name);
 							model: string;
 							provider?: string;
 							ms: number;
+							attempts: number;
 							usage?: Record<string, unknown>;
 							systemPrompt: string;
 							input: string;
 							text: string;
 					  };
 			}
+
+			// A backup request is sent when an attempt hangs (see hedge.ts);
+			// say so, since only the winning attempt's usage is reported.
+			const attemptsNote = (n: number) => (n > 1 ? ` [${n} requests: the first stalled, a backup answered]` : '');
 
 			function logModelCalls(d: ModelDebug, roundTripMs: number) {
 				const t = d.transcription;
@@ -590,7 +595,7 @@ const stationNames = STATIONS.map((s) => s.name);
 				debug.log(
 					'llm',
 					`<- ${t.ms} ms, ${num(t.usage, 'seconds')} s of audio billed, ` +
-						`${num(t.usage, 'input_tokens')} in / ${num(t.usage, 'output_tokens')} out tokens, ${fmtUsd(tCost)}`,
+						`${num(t.usage, 'input_tokens')} in / ${num(t.usage, 'output_tokens')} out tokens, ${fmtUsd(tCost)}${attemptsNote(t.attempts)}`,
 					t.rawText || '(empty: nothing intelligible to transcribe)'
 				);
 
@@ -609,7 +614,7 @@ const stationNames = STATIONS.map((s) => s.name);
 					trCost = num(tr.usage, 'cost');
 					debug.log(
 						'llm',
-						`<- ${tr.ms} ms, ${num(tr.usage, 'prompt_tokens')} in / ${num(tr.usage, 'completion_tokens')} out tokens, ${fmtUsd(trCost)}`,
+						`<- ${tr.ms} ms, ${num(tr.usage, 'prompt_tokens')} in / ${num(tr.usage, 'completion_tokens')} out tokens, ${fmtUsd(trCost)}${attemptsNote(tr.attempts)}`,
 						tr.text
 					);
 				}
