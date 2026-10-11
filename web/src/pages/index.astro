@@ -52,12 +52,17 @@
 			// isn't driven by making every hop globally faster.
 			//
 			// Now a hop is one snippet: SNIPPET_S of a station's most recent
-			// audio, played whole (see snippetPlayer.ts). Same 3s for the
-			// same transcription reason; MIN_SNIPPET_S lets a station that was
+			// audio, played whole (see snippetPlayer.ts). 2s per user
+			// preference for shorter snippets -- re-measured first, with clean
+			// frame-aligned cuts: 3 recordings x {3, 2, 1.5}s, same audio per
+			// recording. Mean words per audio-second 1.38 / 1.20 / 1.29, with
+			// per-clip spread (0.68-1.86) far larger than the differences, and
+			// the ASR deterministic per clip -- no collapse like the 1.5s
+			// regression above showed. MIN_SNIPPET_S lets a station that was
 			// just played, or is still connecting, still contribute a shorter
 			// one rather than being skipped outright.
-			const SNIPPET_S = 3;
-			const MIN_SNIPPET_S = 1.5;
+			const SNIPPET_S = 2;
+			const MIN_SNIPPET_S = 1;
 			// Queue the next snippet once less than this much is left playing
 			// -- decoding a 3s snippet takes milliseconds, so this is pure
 			// margin against timer jitter.
