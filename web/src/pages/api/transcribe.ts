@@ -5,6 +5,9 @@ import { transcribeMp3, translateToEnglish, OpenRouterError } from '../../lib/op
 import { checkRateLimit, rateLimitedResponse } from '../../lib/rateLimit';
 
 const MAX_CLIP_BYTES = 2_000_000; // generous cap on a client-assembled clip
+// Translation normally answers in ~1s; one that hangs is going to fail
+// anyway, so give up well before the user wonders whether anything happened.
+const TRANSLATE_TIMEOUT_MS = 8_000;
 
 export const POST: APIRoute = async ({ request }) => {
   // Checked first, before touching the body -- this is the endpoint that
@@ -37,15 +40,34 @@ export const POST: APIRoute = async ({ request }) => {
     return Response.json({ ok: false, error: 'server misconfigured: no API key' }, { status: 500 });
   }
 
+  // Logged with timing so a failure says what happened -- a
+  // non-OpenRouterError (timeout abort, network error) used to collapse
+  // into a bare "transcription failed" with nothing in the server log.
+  const started = Date.now();
   try {
     const bytes = new Uint8Array(await file.arrayBuffer());
     let text = await transcribeMp3(apiKey, bytes);
     if (text.trim()) {
-      text = await translateToEnglish(apiKey, text);
+      // A failed translation must not throw away a successful
+      // transcription -- the one failure the user hit (16.7s = ~1.7s
+      // transcribe + the translate timeout) did exactly that. Fall back to
+      // the untranslated text instead.
+      try {
+        text = await translateToEnglish(apiKey, text, TRANSLATE_TIMEOUT_MS);
+      } catch (err) {
+        console.error(`[transcribe] translate failed after ${Date.now() - started}ms, returning untranslated:`, err);
+      }
     }
     return Response.json({ ok: true, text, timestamp: new Date().toISOString() });
   } catch (err) {
-    const message = err instanceof OpenRouterError ? err.message : 'transcription failed';
-    return Response.json({ ok: false, error: message }, { status: 502 });
+    const elapsed = Date.now() - started;
+    console.error(`[transcribe] transcription failed after ${elapsed}ms (${file.size}B clip):`, err);
+    const reason =
+      err instanceof OpenRouterError
+        ? err.message
+        : err instanceof Error && err.name === 'AbortError'
+          ? 'transcription timed out'
+          : 'transcription failed';
+    return Response.json({ ok: false, error: reason }, { status: 502 });
   }
 };

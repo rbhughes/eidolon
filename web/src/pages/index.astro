@@ -30,7 +30,7 @@
 		<script>
 			import { STATIONS, pickWeighted } from '../data/stations';
 			import { StationBuffer } from '../lib/stationBuffer';
-			import { BufferedPlayer } from '../lib/bufferedPlayer';
+			import { SnippetPlayer } from '../lib/snippetPlayer';
 
 			const stationEl = document.getElementById('station') as HTMLDivElement;
 			const tuneBtn = document.getElementById('tune') as HTMLButtonElement;
@@ -50,48 +50,68 @@
 			// for transcription to work; the "capture promptly for a
 			// single-fragment clip" idea still holds at this rate too, it just
 			// isn't driven by making every hop globally faster.
-			const HOP_MS = 3_000;
+			//
+			// Now a hop is one snippet: SNIPPET_S of a station's most recent
+			// audio, played whole (see snippetPlayer.ts). Same 3s for the
+			// same transcription reason; MIN_SNIPPET_S lets a station that was
+			// just played, or is still connecting, still contribute a shorter
+			// one rather than being skipped outright.
+			const SNIPPET_S = 3;
+			const MIN_SNIPPET_S = 1.5;
+			// Queue the next snippet once less than this much is left playing
+			// -- decoding a 3s snippet takes milliseconds, so this is pure
+			// margin against timer jitter.
+			const QUEUE_AHEAD_S = 0.75;
+			const TICK_MS = 100;
+			// Tries per tick to find a station with enough fresh audio.
+			const PICK_ATTEMPTS = 6;
 			const BUFFER_WINDOW_MS = 60_000;
 			const MAX_CAPTURE_MS = 60_000; // safety cap if you wait a while before capturing
 
-			let current = STATIONS[0];
-			let hopTimer: ReturnType<typeof setInterval> | null = null;
+			let hopping = false;
+			let hopLoopGeneration = 0;
 			let tunedIn = false;
 			let lastCaptureTime = Date.now();
 
 			const buffer = new StationBuffer(STATIONS, BUFFER_WINDOW_MS);
-			const player = new BufferedPlayer();
+			const player = new SnippetPlayer();
+
+			const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 			// Playback has no connection of its own -- it only ever plays
-			// bytes the buffer has already received and stored for whichever
-			// station is current, so there's nothing left to desync from.
-			buffer.setOnLiveChunk((bytes) => player.feed(bytes));
-
-			function renderStation() {
-				stationEl.textContent = current.name;
-			}
-
-			function hop() {
-				current = pickWeighted();
-				renderStation();
-				buffer.recordHop(current.id, current.name);
-				// Drop anything queued/playing from the previous station so
-				// there's never a backlog to play through -- playback starts
-				// fresh from the new station's next arriving chunk.
-				player.cutover();
+			// snippets the buffer already holds, and every snippet played is
+			// recorded back into the buffer, so the transcript is built from
+			// exactly the bytes that were heard.
+			async function hopLoop(generation: number) {
+				while (generation === hopLoopGeneration) {
+					if (player.queuedSeconds() < QUEUE_AHEAD_S) {
+						for (let attempt = 0; attempt < PICK_ATTEMPTS; attempt++) {
+							const station = pickWeighted();
+							const snippet = buffer.snippet(station, SNIPPET_S, MIN_SNIPPET_S);
+							if (!snippet) continue;
+							const audibleAt = await player.play(snippet);
+							if (audibleAt === null || generation !== hopLoopGeneration) break;
+							buffer.recordPlayed(snippet, audibleAt);
+							setTimeout(() => {
+								if (generation === hopLoopGeneration) stationEl.textContent = station.name;
+							}, audibleAt - Date.now());
+							break;
+						}
+					}
+					await sleep(TICK_MS);
+				}
 			}
 
 			function startHopping() {
+				hopping = true;
 				buffer.start(STATIONS);
-				hop();
-				hopTimer = setInterval(hop, HOP_MS);
+				stationEl.textContent = '-- listening --';
+				void hopLoop(++hopLoopGeneration);
 			}
 
 			function stopHopping() {
-				if (hopTimer !== null) {
-					clearInterval(hopTimer);
-					hopTimer = null;
-				}
+				hopping = false;
+				hopLoopGeneration++;
 				player.stop();
 				buffer.stop();
 			}
@@ -101,7 +121,7 @@
 				if (!tunedIn) return;
 				if (document.hidden) {
 					stopHopping();
-				} else if (hopTimer === null) {
+				} else if (!hopping) {
 					startHopping();
 				}
 			});
@@ -149,7 +169,7 @@
 				if (chunks.length === 0) {
 					appendEntry(new Date().toISOString(), '--', '(nothing buffered yet)');
 					captureBtn.disabled = false;
-					captureBtn.textContent = 'capture';
+					captureBtn.textContent = 'transcript';
 					return;
 				}
 
@@ -188,7 +208,7 @@
 					appendEntry(new Date().toISOString(), labelSummary, `[capture failed: ${err}]`);
 				} finally {
 					captureBtn.disabled = false;
-					captureBtn.textContent = 'capture';
+					captureBtn.textContent = 'transcript';
 				}
 			});
 		</script>

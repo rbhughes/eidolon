@@ -28,14 +28,23 @@
 //    to this buffer's timeline, and a plain <audio src> never skips a
 //    station's burst -- it plays through it at 1x with nothing to ever
 //    reset the lag, so audible output silently ran behind true live
-//    indefinitely. Fix: playback has no connection of its own at all --
-//    see bufferedPlayer.ts, fed via setOnLiveChunk() below with the exact
-//    same already-clean bytes capture reads. Anything audible has, by
-//    construction, already been sitting in this buffer.
+//    indefinitely. Playback has no connection of its own at all.
 //
-// A hop-event timeline lets since() reconstruct which station was
-// actually current during each slice of a requested window, then pulls
-// only that slice from that station's own buffer.
+// 4. Feeding playback the live edge in small pieces as bytes arrive is
+//    *also* wrong: each piece has to be decoded on its own, and that
+//    measured 5.9% audio loss in Chromium and 45.8% in Firefox (see
+//    mp3.ts). Since all 9 stations are buffered continuously anyway, a hop
+//    instead takes a whole snippet -- the station's latest few seconds,
+//    cut on validated frame boundaries -- that is already sitting here,
+//    and the player decodes it as one unit.
+//
+// Sync between what's heard and what's transcribed is by construction:
+// the player reports each snippet it schedules via recordPlayed(), and
+// since() returns exactly those snippets' bytes -- the very same arrays
+// that were decoded for playback, never a re-derivation from timestamps.
+
+import { parseFrames } from './mp3';
+
 export interface Station {
   id: string;
   name: string;
@@ -45,12 +54,35 @@ export interface Station {
 interface RawChunk {
   bytes: Uint8Array;
   t: number;
+  /** Absolute byte position of this chunk in its station's stream. */
+  pos: number;
 }
 
-interface HopEvent {
+interface StationState {
+  chunks: RawChunk[];
+  /** Total bytes ever received -- the absolute position of the next chunk. */
+  received: number;
+  /** Absolute position where this station's last snippet ended, so picking
+   * the same station again continues instead of replaying audio. */
+  cursor: number;
+}
+
+export interface Snippet {
+  station: Station;
+  /** Frames before the snippet, decoded only to warm up the decoder (bit
+   * reservoir / overlap state) and skipped, never played. */
+  primer: Uint8Array;
+  /** Exactly the frames that get played, and transcribed. */
+  audio: Uint8Array;
+  primerSeconds: number;
+  seconds: number;
+}
+
+interface PlayedSnippet {
+  /** Wall-clock time the snippet starts being audible. */
   t: number;
-  stationId: string;
   stationName: string;
+  bytes: Uint8Array;
 }
 
 export interface CapturedChunk {
@@ -58,24 +90,30 @@ export interface CapturedChunk {
   station: string;
 }
 
+// Warm-up frames ahead of each snippet. The bit reservoir can reach back
+// up to 511 bytes and the MDCT overlaps one frame, so 2 is the minimum;
+// one extra for margin.
+const PRIMER_FRAMES = 3;
+// Upper bound on how much of a station's tail to parse per snippet: ~8s
+// at 320kbps, the highest Layer III bitrate.
+const MAX_TAIL_BYTES = 320_000;
+// A station whose newest bytes are older than this isn't live right now
+// (upstream stalled/reconnecting, or we're resuming from a hidden tab and
+// haven't received anything new yet) -- its tail is old audio, not a
+// snippet of what's on air.
+const MAX_STALENESS_MS = 2_000;
+
+const STREAM_RECONNECT_DELAY_MS = 1_000;
+
 export class StationBuffer {
-  private perStation = new Map<string, RawChunk[]>();
+  private perStation = new Map<string, StationState>();
   private controller: AbortController | null = null;
-  private hopEvents: HopEvent[] = [];
+  private played: PlayedSnippet[] = [];
   private readonly windowMs: number;
-  private currentStationId: string | null = null;
-  private onLiveChunk: ((bytes: Uint8Array) => void) | null = null;
 
   constructor(stations: Station[], windowMs = 60_000) {
     this.windowMs = windowMs;
-    for (const s of stations) this.perStation.set(s.id, []);
-  }
-
-  /** Bytes for whichever station is current, in real time, as they're
-   * buffered -- for feeding a BufferedPlayer so playback only ever plays
-   * what's already in this buffer. */
-  setOnLiveChunk(cb: ((bytes: Uint8Array) => void) | null): void {
-    this.onLiveChunk = cb;
+    for (const s of stations) this.perStation.set(s.id, { chunks: [], received: 0, cursor: 0 });
   }
 
   /** Open the one multiplexed connection. Call once at tune-in (and
@@ -92,38 +130,86 @@ export class StationBuffer {
     this.controller = null;
   }
 
-  /** Record that `station` became current, right now. */
-  recordHop(stationId: string, stationName: string): void {
-    const now = Date.now();
-    this.currentStationId = stationId;
-    this.hopEvents.push({ t: now, stationId, stationName });
-    const cutoff = now - this.windowMs;
-    while (this.hopEvents.length > 1 && this.hopEvents[1].t < cutoff) {
-      this.hopEvents.shift();
+  /**
+   * The station's most recent audio, up to `targetSeconds` of it, as whole
+   * frames -- never anything at or before where its previous snippet ended.
+   * Null if less than `minSeconds` is available (still connecting, dead
+   * air upstream, or the same station was just played), or if the station
+   * hasn't delivered anything recently (MAX_STALENESS_MS). Advances the
+   * station's cursor, so call it only for a snippet that will be played.
+   */
+  snippet(station: Station, targetSeconds: number, minSeconds: number): Snippet | null {
+    const state = this.perStation.get(station.id);
+    if (!state || state.chunks.length === 0) return null;
+    if (Date.now() - state.chunks[state.chunks.length - 1].t > MAX_STALENESS_MS) return null;
+
+    // Concatenate just the tail of the buffer -- whole chunks, so the
+    // absolute position of the first byte is known.
+    let first = state.chunks.length;
+    let size = 0;
+    while (first > 0 && size < MAX_TAIL_BYTES) {
+      first--;
+      size += state.chunks[first].bytes.length;
     }
+    const base = state.chunks[first].pos;
+    const tail = new Uint8Array(state.received - base);
+    for (let i = first; i < state.chunks.length; i++) {
+      tail.set(state.chunks[i].bytes, state.chunks[i].pos - base);
+    }
+
+    const frames = parseFrames(tail);
+    // Walk back from the newest frame, staying contiguous (an upstream
+    // reconnect leaves a gap between frames) and after the cursor.
+    let start = frames.length;
+    let seconds = 0;
+    while (start > 0 && seconds < targetSeconds) {
+      const f = frames[start - 1];
+      if (base + f.offset < state.cursor) break;
+      if (start < frames.length && f.offset + f.length !== frames[start].offset) break;
+      start--;
+      seconds += f.seconds;
+    }
+    if (start === frames.length || seconds < minSeconds) return null;
+
+    let primerStart = start;
+    while (
+      primerStart > 0 &&
+      start - primerStart < PRIMER_FRAMES &&
+      frames[primerStart - 1].offset + frames[primerStart - 1].length === frames[primerStart].offset
+    ) {
+      primerStart--;
+    }
+    let primerSeconds = 0;
+    for (let i = primerStart; i < start; i++) primerSeconds += frames[i].seconds;
+
+    const last = frames[frames.length - 1];
+    const audioStart = frames[start].offset;
+    const audioEnd = last.offset + last.length;
+    state.cursor = base + audioEnd;
+    return {
+      station,
+      primer: tail.slice(frames[primerStart].offset, audioStart),
+      audio: tail.slice(audioStart, audioEnd),
+      primerSeconds,
+      seconds
+    };
   }
 
-  /** Everything "heard" (per the hop timeline) from sinceMs to now, in
-   * chronological order, each chunk tagged with whichever station was
-   * actually current when it was buffered. */
+  /** Record a snippet the player has scheduled to become audible at
+   * wall-clock time `t` -- since() reads exactly these. */
+  recordPlayed(snippet: Snippet, t: number): void {
+    this.played.push({ t, stationName: snippet.station.name, bytes: snippet.audio });
+    const cutoff = Date.now() - this.windowMs;
+    while (this.played.length && this.played[0].t < cutoff) this.played.shift();
+  }
+
+  /** Every snippet that started being audible from sinceMs up to now, in
+   * order -- byte-for-byte what was played. */
   since(sinceMs: number): CapturedChunk[] {
     const now = Date.now();
-    const out: CapturedChunk[] = [];
-
-    for (let i = 0; i < this.hopEvents.length; i++) {
-      const hop = this.hopEvents[i];
-      const segStart = Math.max(hop.t, sinceMs);
-      const segEnd = i + 1 < this.hopEvents.length ? this.hopEvents[i + 1].t : now;
-      if (segEnd <= sinceMs || segStart >= segEnd) continue;
-
-      const chunks = this.perStation.get(hop.stationId) ?? [];
-      for (const c of chunks) {
-        if (c.t >= segStart && c.t < segEnd) {
-          out.push({ bytes: c.bytes, station: hop.stationName });
-        }
-      }
-    }
-    return out;
+    return this.played
+      .filter((p) => p.t >= sinceMs && p.t <= now)
+      .map((p) => ({ bytes: p.bytes, station: p.stationName }));
   }
 
   /** Reads the one multiplexed connection and splits frames back out to
@@ -132,10 +218,21 @@ export class StationBuffer {
    * The server already discards each (re)connection's own burst, so
    * every byte seen here is clean, already-live-aligned content. */
   private async demux(stations: Station[], signal: AbortSignal): Promise<void> {
+    // The server drops a client that falls too far behind (see
+    // MAX_QUEUED_BYTES in api/stream.ts), and the connection can also just
+    // drop -- either way, reconnect for as long as we're tuned in.
+    while (!signal.aborted) {
+      await this.readStream(stations, signal);
+      if (!signal.aborted) await new Promise((r) => setTimeout(r, STREAM_RECONNECT_DELAY_MS));
+    }
+  }
+
+  private async readStream(stations: Station[], signal: AbortSignal): Promise<void> {
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
       const res = await fetch('/api/stream', { signal });
       if (!res.body) return;
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
 
       let buf = new Uint8Array(0);
 
@@ -164,16 +261,20 @@ export class StationBuffer {
           const station = stations[stationIndex];
           if (!station) continue;
 
-          const chunks = this.perStation.get(station.id)!;
-          chunks.push({ bytes: payload, t: Date.now() });
-          this.trim(chunks);
-          if (station.id === this.currentStationId && this.onLiveChunk) {
-            this.onLiveChunk(payload);
-          }
+          const state = this.perStation.get(station.id)!;
+          state.chunks.push({ bytes: payload, t: Date.now(), pos: state.received });
+          state.received += payload.length;
+          this.trim(state.chunks);
         }
       }
     } catch {
-      // Aborted at stop(), or a network hiccup -- nothing to recover.
+      // Aborted at stop(), a network hiccup, or a malformed frame --
+      // demux() reconnects unless we were stopped.
+    } finally {
+      // Always release the connection. Exiting this loop (e.g. on a throw)
+      // without cancelling used to leave the response open but unread, and
+      // the server kept queueing bytes for it -- see api/stream.ts.
+      reader?.cancel().catch(() => {});
     }
   }
 

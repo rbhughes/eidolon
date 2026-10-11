@@ -1,82 +1,44 @@
-// Replaces the <audio src="blob:...">-swapping version. That version cut
-// each clip as a Blob, pointed a single <audio> element's src at it, and
-// relied on the 'ended' event to chain to the next clip. Measured choppy
-// in BOTH browsers, worse in Firefox -- which makes sense once you look at
-// what a src swap actually costs: every swap tears down the previous
-// decode pipeline and starts a new one (fetch the blob, sniff/parse the
-// container, prime the decoder, fire 'loadeddata', THEN start producing
-// samples). That startup latency is real wall-clock time with no audio
-// output, it is not deterministic, and it is NOT eliminated by picking
-// better clip boundaries or more careful 'ended'-driven timing -- it's
-// inherent to asking an <audio> element to load a new source. Firefox's
-// pipeline evidently costs more of it than Chromium's, which is why the
-// exact same code sounded "worse" there, but neither is actually silent
-// of gaps.
+// Plays whole snippets (see StationBuffer.snippet()) back to back on the
+// Web Audio clock.
 //
-// Fix: stop using <audio> for stream playback entirely. Use the Web Audio
-// API to decode each chunk to raw PCM (AudioContext.decodeAudioData) and
-// schedule it on an AudioBufferSourceNode at a precise, pre-computed
-// start time (AudioBufferSourceNode.start(when)). Back-to-back scheduled
-// buffers have NO engine-startup gap between them -- this is the standard
-// technique for gapless playback of a sequence of buffers, and it works
-// identically in both browsers because it's sample-accurate scheduling
-// against the audio clock (ctx.currentTime), not wall-clock/event timing.
+// History, all measured rather than guessed:
+// - <audio src="blob:..."> swapping: every src swap restarts the element's
+//   whole decode pipeline before any sound comes out -- choppy in both
+//   browsers, worse in Firefox.
+// - Web Audio, fed the live edge in ~400ms batches, each decoded on its
+//   own: scheduling was gapless (~0ms between start() times), but the
+//   *content* wasn't -- every separately decoded mp3 fragment starts with
+//   ~20-50ms of near-silence (no decoder state from the frames before it),
+//   and Firefox rejects fragments that don't start on a valid frame header
+//   outright. 5.9% of the audio lost in Chromium, 45.8% in Firefox (see
+//   mp3.ts). Still choppy in both, still worse in Firefox.
 //
-// The only timer in this file (DECODE_BATCH_MS) governs how many bytes we
-// hand to decodeAudioData at once -- it has NO effect on playback timing
-// or gaps. That's the opposite of the earlier (rejected) fixed-interval
-// approach, where the timer directly gated when a clip started playing.
-// Here, decoding happens ahead of the scheduled start time (batches are
-// queued into a promise chain as they arrive, decoded while the
-// previously-scheduled buffer is still playing), so sloppy timer timing
-// only affects how far ahead we stay buffered, never whether playback
-// stutters.
+// Now: one decodeAudioData per snippet, so there are no seams inside a
+// snippet at all. The snippet's primer frames are decoded along with it,
+// purely to give the decoder its warm-up state, and skipped via
+// start()'s offset. Each snippet is scheduled to begin exactly where the
+// previous one ends (start(when) on the audio clock is sample-accurate in
+// both browsers), and gets a few-ms fade in/out so the one unavoidable
+// splice per snippet -- two unrelated stations meeting -- doesn't click.
 //
-// Measured (headless Chromium, instrumented AudioBufferSourceNode.start
-// calls directly, not guessed): once a station has a few batches queued,
-// consecutive segments schedule back-to-back with ~0ms gap, confirming
-// the technique works. But right after every hop, the FIRST few batches
-// for the new station had small (tens-to-hundreds of ms) gaps before
-// settling -- because nextStartTime resets to ctx.currentTime (correctly,
-// so there's no backlog from the old station), and the very first batch's
-// startAt is then "now", leaving zero lead for the next batch's decode to
-// finish before its predecessor stops playing. At a 3s hop interval, that
-// ramp-up was eating a real fraction of every single snippet. Fix: give
-// only the first batch after each hop/cutover a small deliberate pre-roll
-// (PRIME_LEAD_S) instead of starting it immediately -- that head start is
-// enough for the pipeline to get ahead of real-time and stay gapless for
-// the rest of the station's window. Costs a fixed, single, predictable
-// silence right at the hop boundary (on top of whatever's already there
-// waiting for the new station's first bytes to arrive) in exchange for
-// eliminating the scattered mid-snippet stutters that used to follow it.
-const DECODE_BATCH_MS = 400;
-const MAX_PENDING_BYTES = 256_000; // safety valve if decode falls behind
-const PRIME_LEAD_S = 0.25;
+// play() calls must not overlap: await each before the next, so snippets
+// queue in order.
 
-function findFrameSync(buf: Uint8Array): number {
-  for (let i = 0; i < buf.length - 2; i++) {
-    if (buf[i] === 0xff && (buf[i + 1] & 0xe0) === 0xe0) {
-      const bitrateIndex = (buf[i + 2] >> 4) & 0x0f;
-      if (bitrateIndex !== 0x0f) return i; // 0b1111 is reserved/invalid -- not a real header
-    }
-  }
-  return -1;
-}
+import type { Snippet } from './stationBuffer';
 
-export class BufferedPlayer {
+const FADE_S = 0.008;
+// Lead given to the very first snippet (or one after a stall), so the
+// start time is never already in the past by the time start() runs.
+const START_LEAD_S = 0.1;
+
+export class SnippetPlayer {
   private ctx: AudioContext;
-  private pending: Uint8Array[] = [];
-  private pendingBytes = 0;
-  private flushTimer: ReturnType<typeof setInterval>;
-  private decodeChain: Promise<void> = Promise.resolve();
-  private generation = 0;
   private nextStartTime = 0;
-  private primed = false;
+  private generation = 0;
   private scheduled = new Set<AudioBufferSourceNode>();
 
   constructor() {
     this.ctx = new AudioContext();
-    this.flushTimer = setInterval(() => this.flush(), DECODE_BATCH_MS);
   }
 
   /** Must be called from a user-gesture handler (e.g. the tune-in click)
@@ -86,24 +48,61 @@ export class BufferedPlayer {
     void this.ctx.resume();
   }
 
-  /** Accumulate one newly-arrived chunk for the current station. Actual
-   * decoding/scheduling happens on the batch timer or the size safety
-   * valve, not here -- see header comment. */
-  feed(bytes: Uint8Array): void {
-    if (bytes.length === 0) return;
-    this.pending.push(bytes);
-    this.pendingBytes += bytes.length;
-    if (this.pendingBytes >= MAX_PENDING_BYTES) this.flush();
+  /** Seconds of audio already scheduled beyond the current moment. */
+  queuedSeconds(): number {
+    return Math.max(0, this.nextStartTime - this.ctx.currentTime);
   }
 
-  /** Called on every hop: stop whatever's currently scheduled from the
-   * previous station immediately (so there's never a backlog to play
-   * through), invalidate any in-flight decode so it can't schedule stale
-   * audio after this point, and reset the scheduling clock. */
-  cutover(): void {
+  /**
+   * Decode and schedule a snippet right after whatever is already queued.
+   * Resolves with the wall-clock time (ms) it becomes audible, or null if
+   * it couldn't be decoded or stop() was called meanwhile.
+   */
+  async play(snippet: Snippet): Promise<number | null> {
+    const gen = this.generation;
+    const bytes = new Uint8Array(snippet.primer.length + snippet.audio.length);
+    bytes.set(snippet.primer, 0);
+    bytes.set(snippet.audio, snippet.primer.length);
+
+    let decoded: AudioBuffer;
+    try {
+      // decodeAudioData detaches its input -- `bytes` is our own copy.
+      decoded = await this.ctx.decodeAudioData(bytes.buffer);
+    } catch {
+      return null;
+    }
+    if (gen !== this.generation) return null;
+
+    const duration = Math.min(snippet.seconds, decoded.duration - snippet.primerSeconds);
+    if (duration <= 0) return null;
+
+    const now = this.ctx.currentTime;
+    const startAt = Math.max(this.nextStartTime, now + START_LEAD_S);
+
+    const gain = this.ctx.createGain();
+    gain.gain.setValueAtTime(0, startAt);
+    gain.gain.linearRampToValueAtTime(1, startAt + FADE_S);
+    gain.gain.setValueAtTime(1, startAt + duration - FADE_S);
+    gain.gain.linearRampToValueAtTime(0, startAt + duration);
+    gain.connect(this.ctx.destination);
+
+    const source = this.ctx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(gain);
+    source.onended = () => {
+      this.scheduled.delete(source);
+      gain.disconnect();
+    };
+    source.start(startAt, snippet.primerSeconds, duration);
+    this.scheduled.add(source);
+    this.nextStartTime = startAt + duration;
+
+    return Date.now() + (startAt - now) * 1000;
+  }
+
+  /** Silence everything scheduled and forget the queue. */
+  stop(): void {
     this.generation++;
-    this.pending = [];
-    this.pendingBytes = 0;
     for (const src of this.scheduled) {
       try {
         src.stop();
@@ -112,61 +111,6 @@ export class BufferedPlayer {
       }
     }
     this.scheduled.clear();
-    this.nextStartTime = this.ctx.currentTime;
-    this.primed = false;
-  }
-
-  stop(): void {
-    this.cutover();
-    clearInterval(this.flushTimer);
-  }
-
-  private flush(): void {
-    if (this.pendingBytes === 0) return;
-    const combined = new Uint8Array(this.pendingBytes);
-    let offset = 0;
-    for (const b of this.pending) {
-      combined.set(b, offset);
-      offset += b.length;
-    }
-    this.pending = [];
-    this.pendingBytes = 0;
-
-    // Trim to the first real frame boundary -- discards at most a few
-    // dozen leading bytes, not worth carrying forward to the next batch.
-    const syncAt = findFrameSync(combined);
-    const aligned = syncAt > 0 ? combined.subarray(syncAt) : combined;
-    const bytesForDecode = aligned.slice(); // own copy: decodeAudioData detaches its input
-
-    const gen = this.generation;
-    // Chain decodes so scheduling order always matches arrival order, even
-    // though decodeAudioData is async and batches can take variable time.
-    this.decodeChain = this.decodeChain.then(() => this.decodeAndSchedule(bytesForDecode, gen));
-  }
-
-  private async decodeAndSchedule(bytes: Uint8Array, gen: number): Promise<void> {
-    if (gen !== this.generation) return; // superseded by a hop while queued
-
-    let audioBuffer: AudioBuffer;
-    try {
-      audioBuffer = await this.ctx.decodeAudioData(bytes.buffer as ArrayBuffer);
-    } catch {
-      // Not enough bytes yet, or a batch boundary landed somewhere a
-      // decoder couldn't parse -- drop this batch. The next one starts
-      // fresh at a real frame sync, so this never compounds.
-      return;
-    }
-    if (gen !== this.generation) return; // hop happened while decoding
-
-    const source = this.ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(this.ctx.destination);
-    source.onended = () => this.scheduled.delete(source);
-
-    const startAt = this.primed ? Math.max(this.ctx.currentTime, this.nextStartTime) : this.ctx.currentTime + PRIME_LEAD_S;
-    this.primed = true;
-    source.start(startAt);
-    this.nextStartTime = startAt + audioBuffer.duration;
-    this.scheduled.add(source);
+    this.nextStartTime = 0;
   }
 }
