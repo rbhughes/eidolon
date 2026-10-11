@@ -1,41 +1,207 @@
 ---
+import { STATIONS } from '../data/stations';
+
+const stationNames = STATIONS.map((s) => s.name);
 ---
 
 <html lang="en">
 	<head>
 		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<meta name="viewport" content="width=device-width" />
 		<meta name="generator" content={Astro.generator} />
-		<title>Eidolon</title>
+		<title>Eidolon — a spirit box, debugged</title>
+		<link rel="canonical" href="https://ghost.purr.io/" />
+		<meta
+			name="description"
+			content="A Halloween spirit box that hops live internet radio stations and lets two language models decide what the spirits said. Skeptic mode shows every step."
+		/>
+		<meta property="og:type" content="website" />
+		<meta property="og:site_name" content="purr.io" />
+		<meta property="og:url" content="https://ghost.purr.io/" />
+		<meta property="og:title" content="Eidolon — a spirit box, debugged" />
+		<meta
+			property="og:description"
+			content="Think of a question, then invoke the spirits. Or switch to skeptic mode and watch every buffer, token and cent."
+		/>
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<link
+			href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&family=Creepster&family=Cormorant+Garamond:wght@500;600&display=swap"
+			rel="stylesheet"
+		/>
 	</head>
-	<body>
-		<main>
+	<body data-mode="spooky">
+		<script is:inline>
+			// Pick the mode before first paint so a saved "skeptic" doesn't
+			// flash the spooky page first. The module script re-derives it.
+			(function () {
+				var m = location.hash.slice(1);
+				if (m !== 'skeptic' && m !== 'spooky') {
+					try {
+						m = localStorage.getItem('eidolon-mode');
+					} catch (e) {}
+				}
+				if (m === 'skeptic' || m === 'spooky') document.body.dataset.mode = m;
+			})();
+		</script>
+		<div class="mode-toggle" role="group" aria-label="Display mode">
+			<button type="button" data-set-mode="spooky" aria-pressed="true">spooky</button>
+			<button type="button" data-set-mode="skeptic" aria-pressed="false">skeptic</button>
+		</div>
+
+		<!-- skeptic: purr.io subdomain chrome -->
+		<nav class="topnav skeptic-only">
+			<a class="logo" href="https://purr.io" aria-label="purr.io"><img src="/purrio_2026.png" alt="purr.io logo" /></a>
+			<span class="brand">Eidolon</span>
+			<span class="vintage">Halloween 2026 &middot; mostly for fun</span>
+		</nav>
+		<header class="masthead skeptic-only">
+			<h1>A spirit box, <em>debugged.</em></h1>
+			<p class="tagline">
+				A spirit box sweeps across radio stations so quickly that only fragments of speech get through, and believers
+				hear the dead in the gaps. This one hops nine live internet radio stations, plays a two-second snippet from each,
+				and hands exactly what you heard to two language models to transcribe and translate. Every step is logged below,
+				so you can watch precisely how little of it is supernatural.
+			</p>
+		</header>
+
+		<!-- spooky: minimal -->
+		<header class="spooky-head spooky-only">
 			<h1>Eidolon</h1>
-			<p class="sub">a radio-static spirit box. hop through live stations, capture a few seconds, see what comes through.</p>
+			<p class="invocation">Think of a question. Hold it in your mind.<br />When you are ready, invoke the spirits.</p>
+			<p class="hint-small">sound on &middot; then ask them what they said</p>
+		</header>
 
-			<div class="panel">
-				<div class="station" id="station">-- not tuned in --</div>
-				<div class="controls">
-					<button id="tune">tune in</button>
-					<button id="capture" disabled>transcript</button>
-				</div>
-			</div>
-
-			<div class="log" id="log">
-				<p class="hint">transcript will appear here</p>
+		<main class="console">
+			<canvas class="waveform spooky-only" id="waveform" aria-hidden="true"></canvas>
+			<div class="station skeptic-only" id="station">-- not tuned in --</div>
+			<div class="controls">
+				<button type="button" id="tune">invoke the spirits!</button>
+				<button type="button" id="capture" disabled>what did they say?</button>
+				<button type="button" id="stop" disabled>banish the spirits</button>
 			</div>
 		</main>
+
+		<section class="oracle spooky-only" aria-live="polite">
+			<p class="oracle-latest" id="oracle-latest"></p>
+			<ol class="oracle-earlier" id="oracle-earlier"></ol>
+		</section>
+
+		<section class="panels skeptic-only">
+			<div class="panel">
+				<h2>Transcript</h2>
+				<p class="panel-note">Everything played since the previous transcript, sent as one clip.</p>
+				<div class="log" id="log">
+					<p class="hint">Tune in, listen for a while, then press <strong>transcript</strong>.</p>
+				</div>
+			</div>
+			<div class="panel debug-panel">
+				<h2>Behind the scenes</h2>
+				<p class="panel-note">
+					Every step the page and server take, as it happens: connections, snippet picks, playback, model calls with their
+					prompts, token counts and the cost OpenRouter reports.
+				</p>
+				<div class="debug-log" id="debug-log" role="log" aria-label="Debug log"></div>
+			</div>
+		</section>
+
+		<article class="story skeptic-only">
+			<h2>Mostly for fun</h2>
+			<p>
+				This is a Halloween toy and an excuse to learn something, nothing more. The models transcribe whatever the radio
+				actually said, and speech-to-text models are famous for inventing confident words out of noise, which happens to be
+				exactly the property a spirit box wants. If the dead really are reaching out through internet radio, they are
+				fighting the same battles I was: a TLS handshake per station, a CORS policy written by the living, and a
+				two-second burst of stale buffer every time they reconnect. One assumes the afterlife has better retry logic.
+			</p>
+
+			<h2>Internet radio is not a radio</h2>
+			<p>
+				The original Eidolon is a command-line tool that drives real radio hardware. Retuning a software-defined radio is
+				nearly instant and the audio is live. An internet station is an HTTP stream instead, and getting a few seconds of
+				it means DNS, a TLS handshake and the server&rsquo;s <em>burst-on-connect</em>: Icecast and StreamTheWorld
+				servers send every new listener several seconds of pre-buffered audio so playback starts smoothly. Reconnect on
+				every hop and you replay that catch-up burst each time; measured, it inflated the audio to about 3.5&times; real
+				time. What the web version does instead:
+			</p>
+			<ul>
+				<li>
+					<strong>Stay connected.</strong> The server holds one connection per station open for the whole session and
+					discards the first two seconds of each, so everything after that is live.
+				</li>
+				<li>
+					<strong>Multiplex.</strong> Browsers allow six HTTP/1.1 connections per site, so nine open streams starved
+					everything else, including the transcription request. The server merges all nine into one framed stream
+					(<code>[station][length][bytes]</code>) that the page splits back apart, and it disconnects any listener that
+					stops reading rather than buffering for them.
+				</li>
+				<li>
+					<strong>Cut on frames.</strong> Playing the live edge in small pieces failed: an MP3 fragment decoded on its own
+					starts in silence, and Firefox rejected 21 of 48 of them outright, losing 46% of the audio. Each hop now takes
+					a station&rsquo;s latest two seconds, cut on validated MP3 frame boundaries with three warm-up frames for the
+					decoder, and schedules it to start the instant the previous snippet ends.
+				</li>
+				<li>
+					<strong>Transcribe what you heard.</strong> The transcript is assembled from the exact bytes that were played,
+					not fetched again, so it cannot drift from what came out of your speakers.
+				</li>
+			</ul>
+
+			<h2>The hardware version: RTL-SDR Blog V4</h2>
+			<p>
+				The command-line version listens through an{' '}
+				<a href="https://www.rtl-sdr.com/v4/">RTL-SDR Blog V4</a>, an inexpensive USB software-defined radio built on the
+				RTL2832U, a chip originally made for digital TV dongles, and an R828D tuner. The V4 adds a 1&nbsp;PPM
+				temperature-compensated oscillator, a built-in HF upconverter, a bias tee and an aluminium case. Eidolon hops the
+				US FM grid (odd tenths from 88.1&nbsp;MHz, 200&nbsp;kHz apart) and favours frequencies where an{' '}
+				<code>rtl_power</code> scan found real stations, with some purely random hops kept for static. A web page
+				can&rsquo;t reach a USB radio on a stranger&rsquo;s desk, hence internet radio here.
+			</p>
+
+			<h2>Models, tokens and cost</h2>
+			<p>
+				Speech-to-text is <code>mistralai/voxtral-mini-transcribe</code> through{' '}
+				<a href="https://openrouter.ai">OpenRouter</a>, chosen for latency over Whisper-class models, at $0.003 per minute
+				of audio. It doesn&rsquo;t translate, and most of these stations aren&rsquo;t in English, so a second call sends
+				the transcript to <code>openai/gpt-4o-mini</code> with a one-paragraph system prompt ($0.15 per million input
+				tokens, $0.60 per million output). A typical 30-second transcript costs about $0.0015 to transcribe and $0.00005
+				to translate, roughly 650 transcripts per dollar. The log above shows the exact token counts and cost OpenRouter
+				reports for each request. Transcription is limited to ten requests a minute per visitor, which is all the
+				protection the budget needs.
+			</p>
+		</article>
+
+		<footer class="skeptic-only">
+			<p>
+				Audio: public live streams from {stationNames.join(', ')}. No affiliation with any of them, living or otherwise.
+			</p>
+			<p class="colophon">A <a href="https://purr.io">purr.io</a> project &middot; &copy; 2026 &middot; built in the open</p>
+		</footer>
+		<footer class="spooky-foot spooky-only">
+			<p>
+				a <a href="https://purr.io">purr.io</a> project &middot; curious how it works?{' '}
+				<button type="button" class="link-button" data-set-mode="skeptic">switch to skeptic mode</button>
+			</p>
+		</footer>
 
 		<script>
 			import { STATIONS, pickWeighted } from '../data/stations';
 			import { StationBuffer } from '../lib/stationBuffer';
 			import { SnippetPlayer } from '../lib/snippetPlayer';
+			import { DebugLog } from '../lib/debugLog';
+			import { Waveform } from '../lib/waveform';
+
+			type Mode = 'skeptic' | 'spooky';
 
 			const stationEl = document.getElementById('station') as HTMLDivElement;
 			const tuneBtn = document.getElementById('tune') as HTMLButtonElement;
 			const captureBtn = document.getElementById('capture') as HTMLButtonElement;
+			const stopBtn = document.getElementById('stop') as HTMLButtonElement;
 			const log = document.getElementById('log') as HTMLDivElement;
+			const oracleLatest = document.getElementById('oracle-latest') as HTMLParagraphElement;
+			const oracleEarlier = document.getElementById('oracle-earlier') as HTMLOListElement;
+			const debug = new DebugLog(document.getElementById('debug-log') as HTMLDivElement);
 
 			// Tried matching the CLI's chunk_seconds (1.5s) directly -- measured
 			// regression, not an improvement: "since last capture" means a
@@ -72,16 +238,102 @@
 			const PICK_ATTEMPTS = 6;
 			const BUFFER_WINDOW_MS = 60_000;
 			const MAX_CAPTURE_MS = 60_000; // safety cap if you wait a while before capturing
+			const STATS_INTERVAL_MS = 10_000;
+			const MODE_KEY = 'eidolon-mode';
 
+			let mode: Mode = 'spooky';
 			let hopping = false;
 			let hopLoopGeneration = 0;
+			let statsTimer: ReturnType<typeof setInterval> | null = null;
 			let tunedIn = false;
+			let transcribing = false;
+			// Aborts the in-flight /api/transcribe request when stop is pressed.
+			let transcribeAbort: AbortController | null = null;
 			let lastCaptureTime = Date.now();
+			let sessionCost = 0;
+			let transcriptCount = 0;
+			let waitingLogged = false;
 
 			const buffer = new StationBuffer(STATIONS, BUFFER_WINDOW_MS);
 			const player = new SnippetPlayer();
+			const waveform = new Waveform(document.getElementById('waveform') as HTMLCanvasElement, player.analyser);
 
 			const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+			const fmtBytes = (n: number) => `${n.toLocaleString('en-US')} B`;
+			const fmtUsd = (n: number) => `$${n.toFixed(6)}`;
+			const fmtClock = (ms: number) => new Date(ms).toLocaleTimeString('en-US', { hour12: false });
+			const num = (o: Record<string, unknown> | undefined, k: string) => (typeof o?.[k] === 'number' ? (o[k] as number) : 0);
+
+			// --- mode -------------------------------------------------------
+
+			function initialMode(): Mode {
+				const fromHash = location.hash.slice(1);
+				if (fromHash === 'skeptic' || fromHash === 'spooky') return fromHash;
+				try {
+					const saved = localStorage.getItem(MODE_KEY);
+					if (saved === 'skeptic' || saved === 'spooky') return saved;
+				} catch {
+					// Storage blocked -- default is fine.
+				}
+				return 'spooky';
+			}
+
+			function setMode(next: Mode) {
+				mode = next;
+				document.body.dataset.mode = next;
+				for (const b of document.querySelectorAll<HTMLButtonElement>('.mode-toggle [data-set-mode]')) {
+					b.setAttribute('aria-pressed', String(b.dataset.setMode === next));
+				}
+				try {
+					localStorage.setItem(MODE_KEY, next);
+				} catch {
+					// Storage blocked -- the toggle still works for this visit.
+				}
+				history.replaceState(null, '', `#${next}`);
+				renderButtons();
+				if (next === 'skeptic') debug.scrollToEnd();
+			}
+
+			for (const b of document.querySelectorAll<HTMLButtonElement>('[data-set-mode]')) {
+				b.addEventListener('click', () => {
+					setMode(b.dataset.setMode as Mode);
+					if (b.classList.contains('link-button')) window.scrollTo({ top: 0 });
+				});
+			}
+
+			function renderButtons() {
+				const spooky = mode === 'spooky';
+				tuneBtn.textContent = tunedIn
+					? spooky
+						? 'the spirits are listening…'
+						: 'tuned in'
+					: spooky
+						? 'invoke the spirits!'
+						: 'tune in';
+				captureBtn.textContent = transcribing
+					? spooky
+						? 'listening beyond the veil…'
+						: 'transcribing…'
+					: spooky
+						? 'what did they say?'
+						: 'transcript';
+				stopBtn.textContent = spooky ? 'banish the spirits' : 'stop';
+				tuneBtn.disabled = tunedIn;
+				captureBtn.disabled = !tunedIn || transcribing;
+				stopBtn.disabled = !tunedIn && !transcribing;
+			}
+
+			// --- listening --------------------------------------------------
+
+			buffer.setEventSink((e) => {
+				if (e.kind === 'connected') {
+					debug.log('stream', `GET /api/stream connected: one multiplexed connection carrying ${STATIONS.length} stations`);
+				} else if (e.kind === 'first-audio') {
+					debug.log('stream', `first audio from ${e.station.name} (server already dropped its 2 s connect burst)`);
+				} else {
+					debug.log('stream', `connection lost (${e.reason}), reconnecting in 1 s`);
+				}
+			});
 
 			// Playback has no connection of its own -- it only ever plays
 			// snippets the buffer already holds, and every snippet played is
@@ -90,33 +342,63 @@
 			async function hopLoop(generation: number) {
 				while (generation === hopLoopGeneration) {
 					if (player.queuedSeconds() < QUEUE_AHEAD_S) {
+						let queued = false;
 						for (let attempt = 0; attempt < PICK_ATTEMPTS; attempt++) {
 							const station = pickWeighted();
 							const snippet = buffer.snippet(station, SNIPPET_S, MIN_SNIPPET_S);
 							if (!snippet) continue;
-							const audibleAt = await player.play(snippet);
-							if (audibleAt === null || generation !== hopLoopGeneration) break;
-							buffer.recordPlayed(snippet, audibleAt);
+							const scheduled = await player.play(snippet);
+							if (scheduled === null || generation !== hopLoopGeneration) break;
+							buffer.recordPlayed(snippet, scheduled.audibleAt);
+							queued = true;
+							debug.log(
+								'hop',
+								`${station.name}: ${snippet.seconds.toFixed(2)} s snippet = ${snippet.frames} MP3 frames ` +
+									`(${fmtBytes(snippet.audio.length)}) + ${snippet.primerFrames} warm-up frames, ` +
+									`decoded in ${scheduled.decodeMs.toFixed(0)} ms, queued ${scheduled.leadSeconds.toFixed(2)} s ahead`
+							);
 							setTimeout(() => {
-								if (generation === hopLoopGeneration) stationEl.textContent = station.name;
-							}, audibleAt - Date.now());
+								if (generation !== hopLoopGeneration) return;
+								stationEl.textContent = station.name;
+								debug.log('play', `start  ${station.name}`);
+							}, scheduled.audibleAt - Date.now());
+							setTimeout(() => {
+								if (generation === hopLoopGeneration) debug.log('play', `end    ${station.name} (${scheduled.seconds.toFixed(2)} s)`);
+							}, scheduled.endsAt - Date.now());
 							break;
+						}
+						if (queued) {
+							waitingLogged = false;
+						} else if (player.queuedSeconds() === 0 && !waitingLogged) {
+							debug.log('hop', `no station has ${MIN_SNIPPET_S} s of fresh audio yet, waiting`);
+							waitingLogged = true;
 						}
 					}
 					await sleep(TICK_MS);
 				}
 			}
 
+			function logStats() {
+				const parts = buffer
+					.stats(STATIONS)
+					.map((s) => `${s.station.name} ${s.kbps.toFixed(0)}`)
+					.join(' · ');
+				debug.log('stream', `receive rate, kbps: ${parts}`);
+			}
+
 			function startHopping() {
 				hopping = true;
 				buffer.start(STATIONS);
 				stationEl.textContent = '-- listening --';
+				statsTimer = setInterval(logStats, STATS_INTERVAL_MS);
 				void hopLoop(++hopLoopGeneration);
 			}
 
 			function stopHopping() {
 				hopping = false;
 				hopLoopGeneration++;
+				if (statsTimer !== null) clearInterval(statsTimer);
+				statsTimer = null;
 				player.stop();
 				buffer.stop();
 			}
@@ -125,45 +407,92 @@
 			document.addEventListener('visibilitychange', () => {
 				if (!tunedIn) return;
 				if (document.hidden) {
+					debug.log('sys', 'tab hidden: stopping playback and closing the stream');
 					stopHopping();
 				} else if (!hopping) {
+					debug.log('sys', 'tab visible again: reconnecting');
 					startHopping();
 				}
 			});
 
+			tuneBtn.addEventListener('click', () => {
+				if (tunedIn) return;
+				tunedIn = true;
+				lastCaptureTime = Date.now();
+				renderButtons();
+				// AudioContext starts suspended until a user gesture resumes it
+				// -- this click is that gesture.
+				player.resume();
+				debug.log(
+					'sys',
+					`tune in: Web Audio at ${player.analyser.context.sampleRate} Hz, ${STATIONS.length} stations, ` +
+						`${SNIPPET_S} s snippets (min ${MIN_SNIPPET_S} s), next one queued when < ${QUEUE_AHEAD_S} s remains`
+				);
+				startHopping();
+			});
+
+			// Stop everything: playback, the stream, and any transcript still
+			// in flight. Aborting the fetch also aborts the request on the
+			// server, which passes that on to its OpenRouter calls.
+			stopBtn.addEventListener('click', () => {
+				if (transcribeAbort) {
+					transcribeAbort.abort();
+					debug.log('capture', 'stop: transcript request aborted (the server abandons its OpenRouter calls)');
+				}
+				if (tunedIn) {
+					tunedIn = false;
+					stopHopping();
+					stationEl.textContent = '-- stopped --';
+					debug.log('sys', 'stop: playback silenced, stream closed');
+				}
+				renderButtons();
+			});
+
+			// --- transcript -------------------------------------------------
+
 			function clearHint() {
-				const hint = log.querySelector('.hint');
-				if (hint) hint.remove();
+				log.querySelector('.hint')?.remove();
 			}
 
 			function appendEntry(timestamp: string, station: string, text: string) {
 				clearHint();
 				const entry = document.createElement('div');
 				entry.className = 'entry';
-				const time = new Date(timestamp).toLocaleTimeString();
-				entry.innerHTML = `<span class="time">${time}</span><span class="from">${station}</span><span class="text"></span>`;
-				entry.querySelector('.text')!.textContent = text || '(silence)';
-				log.prepend(entry);
+				const time = document.createElement('span');
+				time.className = 'time';
+				time.textContent = new Date(timestamp).toLocaleTimeString();
+				const from = document.createElement('span');
+				from.className = 'from';
+				from.textContent = station;
+				const body = document.createElement('span');
+				body.className = 'text';
+				body.textContent = text || '(silence)';
+				// appendChild/insertBefore rather than append()/prepend():
+				// @cloudflare/workers-types redefines those DOM methods
+				// project-wide (see web/CLAUDE.md).
+				entry.appendChild(time);
+				entry.appendChild(from);
+				entry.appendChild(body);
+				log.insertBefore(entry, log.firstChild);
 			}
 
-			tuneBtn.addEventListener('click', () => {
-				if (tunedIn) return;
-				tunedIn = true;
-				tuneBtn.textContent = 'tuned in';
-				tuneBtn.disabled = true;
-				captureBtn.disabled = false;
-				lastCaptureTime = Date.now();
-				// AudioContext starts suspended until a user gesture resumes it
-				// -- this click is that gesture.
-				player.resume();
-				startHopping();
-			});
+			function showOracle(text: string) {
+				if (oracleLatest.textContent) {
+					const li = document.createElement('li');
+					li.textContent = oracleLatest.textContent;
+					oracleEarlier.insertBefore(li, oracleEarlier.firstChild);
+				}
+				oracleLatest.textContent = text;
+				oracleLatest.classList.remove('arrive');
+				void oracleLatest.offsetWidth; // restart the fade-in animation
+				oracleLatest.classList.add('arrive');
+			}
 
 			captureBtn.addEventListener('click', async () => {
-				captureBtn.disabled = true;
-				captureBtn.textContent = 'transcribing...';
+				transcribing = true;
+				renderButtons();
 
-				// Everything buffered since the *previous* capture (or since
+				// Everything played since the *previous* capture (or since
 				// tune-in, for the first one), capped so an unusually long gap
 				// before capturing can't balloon the clip.
 				const now = Date.now();
@@ -172,9 +501,11 @@
 
 				const chunks = buffer.since(cutoff);
 				if (chunks.length === 0) {
-					appendEntry(new Date().toISOString(), '--', '(nothing buffered yet)');
-					captureBtn.disabled = false;
-					captureBtn.textContent = 'transcript';
+					appendEntry(new Date().toISOString(), '--', '(nothing played yet)');
+					showOracle('The spirits have not spoken yet. Listen a little longer.');
+					debug.log('capture', 'nothing played since the last transcript, no request sent');
+					transcribing = false;
+					renderButtons();
 					return;
 				}
 
@@ -195,153 +526,642 @@
 				const formData = new FormData();
 				formData.append('file', new Blob([combined as BlobPart], { type: 'audio/mpeg' }), 'clip.mp3');
 
-				console.log(
-					`[capture] window=${((now - cutoff) / 1000).toFixed(1)}s bytes=${totalLen} chunks=${chunks.length} labels=${labelSummary}`
+				debug.log(
+					'capture',
+					`${chunks.length} snippets played since ${fmtClock(cutoff)}, concatenated as-is ` +
+						`(${fmtBytes(totalLen)} of MP3) -> POST /api/transcribe`,
+					labelSummary
 				);
 				const fetchStart = performance.now();
+				const abort = new AbortController();
+				transcribeAbort = abort;
 
 				try {
-					const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
-					console.log(`[capture] /api/transcribe responded in ${(performance.now() - fetchStart).toFixed(0)}ms`);
-					const data = await res.json();
+					const res = await fetch('/api/transcribe', { method: 'POST', body: formData, signal: abort.signal });
+					const data = (await res.json()) as
+						| { ok: true; text: string; timestamp: string; debug: ModelDebug }
+						| { ok: false; error: string };
+					const roundTrip = performance.now() - fetchStart;
 					if (data.ok) {
+						logModelCalls(data.debug, roundTrip);
 						appendEntry(data.timestamp, labelSummary, data.text);
+						showOracle(data.text || '…only static…');
 					} else {
-						appendEntry(new Date().toISOString(), labelSummary, `[capture failed: ${data.error}]`);
+						debug.log('error', `/api/transcribe ${res.status} after ${roundTrip.toFixed(0)} ms: ${data.error}`);
+						appendEntry(new Date().toISOString(), labelSummary, `[transcript failed: ${data.error}]`);
+						showOracle('The connection to the other side faded. Ask again.');
 					}
 				} catch (err) {
-					appendEntry(new Date().toISOString(), labelSummary, `[capture failed: ${err}]`);
+					if (abort.signal.aborted) {
+						appendEntry(new Date().toISOString(), labelSummary, '(transcript cancelled)');
+						return;
+					}
+					debug.log('error', `/api/transcribe request failed: ${err}`);
+					appendEntry(new Date().toISOString(), labelSummary, `[transcript failed: ${err}]`);
+					showOracle('The connection to the other side faded. Ask again.');
 				} finally {
-					captureBtn.disabled = false;
-					captureBtn.textContent = 'transcript';
+					transcribeAbort = null;
+					transcribing = false;
+					renderButtons();
 				}
 			});
-		</script>
 
-		<style>
-			:root {
-				--bg: #0a0a0d;
-				--panel: #15131a;
-				--fg: #d8d0e0;
-				--dim: #6e647f;
-				--accent: #7b5fd1;
-				--accent-glow: #a78bfa;
+			interface ModelDebug {
+				clipBytes: number;
+				transcription: { model: string; ms: number; usage?: Record<string, unknown>; rawText: string };
+				translation:
+					| null
+					| { error: string }
+					| {
+							model: string;
+							provider?: string;
+							ms: number;
+							usage?: Record<string, unknown>;
+							systemPrompt: string;
+							input: string;
+							text: string;
+					  };
 			}
 
+			function logModelCalls(d: ModelDebug, roundTripMs: number) {
+				const t = d.transcription;
+				debug.log('llm', `-> ${t.model} (server-side): ${fmtBytes(d.clipBytes)} of MP3`);
+				const tCost = num(t.usage, 'cost');
+				debug.log(
+					'llm',
+					`<- ${t.ms} ms, ${num(t.usage, 'seconds')} s of audio billed, ` +
+						`${num(t.usage, 'input_tokens')} in / ${num(t.usage, 'output_tokens')} out tokens, ${fmtUsd(tCost)}`,
+					t.rawText || '(empty: nothing intelligible to transcribe)'
+				);
+
+				let trCost = 0;
+				const tr = d.translation;
+				if (tr === null) {
+					debug.log('llm', 'translation skipped: empty transcript');
+				} else if ('error' in tr) {
+					debug.log('error', `translation failed, showing the untranslated text: ${tr.error}`);
+				} else {
+					debug.log(
+						'llm',
+						`-> ${tr.model}${tr.provider ? ` via ${tr.provider}` : ''}, temperature 0, 2 messages:`,
+						`[system] ${tr.systemPrompt}\n[user]   ${tr.input}`
+					);
+					trCost = num(tr.usage, 'cost');
+					debug.log(
+						'llm',
+						`<- ${tr.ms} ms, ${num(tr.usage, 'prompt_tokens')} in / ${num(tr.usage, 'completion_tokens')} out tokens, ${fmtUsd(trCost)}`,
+						tr.text
+					);
+				}
+
+				transcriptCount++;
+				sessionCost += tCost + trCost;
+				debug.log(
+					'cost',
+					`this transcript ${fmtUsd(tCost + trCost)} (round trip ${roundTripMs.toFixed(0)} ms); ` +
+						`session total ${fmtUsd(sessionCost)} over ${transcriptCount} transcript${transcriptCount === 1 ? '' : 's'}`
+				);
+			}
+
+			setMode(initialMode());
+			// Idle shimmer from the start; it swells once there's audio.
+			waveform.start();
+			debug.log('sys', `page ready: ${STATIONS.length} stations configured, waiting for tune in`);
+		</script>
+
+		<style is:global>
+			/* ---------- shared ---------- */
 			* {
 				box-sizing: border-box;
 			}
-
-			html,
+			html {
+				height: 100%;
+			}
 			body {
 				margin: 0;
-				background: var(--bg);
-				color: var(--fg);
-				font-family: 'Courier New', ui-monospace, monospace;
+				min-height: 100vh;
+				display: flex;
+				flex-direction: column;
+				font: 15px/1.6 Poppins, system-ui, -apple-system, 'Segoe UI', sans-serif;
+			}
+			body > footer {
+				margin-top: auto;
+			}
+			body[data-mode='skeptic'] .spooky-only,
+			body[data-mode='spooky'] .skeptic-only {
+				display: none !important;
 			}
 
-			main {
-				max-width: 640px;
-				margin: 0 auto;
-				padding: 3rem 1.25rem 4rem;
+			.mode-toggle {
+				position: fixed;
+				top: calc(0.55rem + env(safe-area-inset-top, 0px));
+				right: 1rem;
+				z-index: 10;
+				display: flex;
+				padding: 3px;
+				border-radius: 999px;
+			}
+			.mode-toggle button {
+				font: 700 0.85rem/1 Poppins, system-ui, sans-serif;
+				letter-spacing: 0.02em;
+				border: 0;
+				border-radius: 999px;
+				padding: 0.5rem 1rem;
+				cursor: pointer;
+				background: transparent;
 			}
 
-			h1 {
-				font-size: 1.8rem;
-				letter-spacing: 0.15em;
-				text-transform: lowercase;
-				color: var(--accent-glow);
-				text-shadow: 0 0 18px rgba(167, 139, 250, 0.5);
-				margin: 0 0 0.5rem;
+			.console {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				gap: 1rem;
 			}
-
-			.sub {
-				color: var(--dim);
-				font-size: 0.9rem;
-				line-height: 1.5;
-				margin: 0 0 2rem;
-			}
-
-			.panel {
-				background: var(--panel);
-				border: 1px solid #2a2433;
-				border-radius: 8px;
-				padding: 1.25rem;
-				margin-bottom: 1.5rem;
-			}
-
-			.station {
-				font-size: 1.1rem;
-				letter-spacing: 0.08em;
-				color: var(--accent-glow);
-				margin-bottom: 1rem;
-				min-height: 1.4em;
-			}
-
 			.controls {
 				display: flex;
-				gap: 0.75rem;
+				flex-wrap: wrap;
+				justify-content: center;
+				gap: 0.8rem;
 			}
-
-			button {
-				flex: 1;
-				background: transparent;
-				color: var(--fg);
-				border: 1px solid var(--accent);
-				border-radius: 6px;
-				padding: 0.7rem 1rem;
-				font-family: inherit;
-				font-size: 0.95rem;
-				letter-spacing: 0.05em;
+			.controls button {
 				cursor: pointer;
-				transition: background 0.15s, color 0.15s;
 			}
-
-			button:hover:not(:disabled) {
-				background: var(--accent);
-				color: #fff;
-			}
-
-			button:disabled {
-				opacity: 0.4;
+			.controls button:disabled {
 				cursor: default;
 			}
 
-			.log {
-				display: flex;
-				flex-direction: column;
-				gap: 0.9rem;
+			/* ---------- skeptic: purr.io subdomain conventions ---------- */
+			body[data-mode='skeptic'] {
+				--page: #f3f4f6;
+				--surface: #ffffff;
+				--ink: #262e42;
+				--ink-2: #5b6577;
+				--muted: #9aa0ab;
+				--hairline: #dfe1e6;
+				--border: rgba(38, 46, 66, 0.12);
+				--accent: #4a6fa5;
+				--brand: #eeb63f;
+				--orange: #d95f00;
+				background: var(--page);
+				color: var(--ink);
+			}
+			body[data-mode='skeptic'] a {
+				color: var(--accent);
+			}
+			body[data-mode='skeptic'] .mode-toggle {
+				background: var(--surface);
+				border: 1px solid var(--border);
+			}
+			body[data-mode='skeptic'] .mode-toggle button {
+				color: var(--ink-2);
+			}
+			body[data-mode='skeptic'] .mode-toggle button[aria-pressed='true'] {
+				background: var(--brand);
+				color: var(--ink);
 			}
 
-			.hint {
-				color: var(--dim);
+			.topnav {
+				display: flex;
+				align-items: center;
+				gap: 0.5rem;
+				padding: 0.55rem 2.1rem;
+				padding-right: 13rem;
+				border-bottom: 1px solid var(--hairline);
+				background: var(--surface);
+			}
+			.topnav .logo img {
+				height: 26px;
+				width: 26px;
+				display: block;
+				border-radius: 6px;
+			}
+			.topnav .brand {
+				font-weight: 700;
+				color: var(--orange);
+				margin-right: 0.5rem;
+			}
+			.topnav .vintage {
+				margin-left: auto;
+				color: var(--muted);
 				font-size: 0.85rem;
 			}
+			.masthead {
+				padding: 1.1rem 2.1rem 0.3rem;
+			}
+			.masthead h1 {
+				margin: 0;
+				font-size: 1.5rem;
+				letter-spacing: -0.01em;
+			}
+			.masthead h1 em {
+				color: var(--orange);
+				font-style: italic;
+			}
+			.tagline {
+				margin: 0.5rem 0 0;
+				color: var(--ink-2);
+				font-size: 1.12rem;
+				line-height: 1.6;
+				max-width: 70rem;
+			}
 
-			.entry {
+			body[data-mode='skeptic'] .console {
+				flex-direction: row;
+				flex-wrap: wrap;
+				justify-content: flex-start;
+				padding: 0.9rem 2.1rem;
+			}
+			.station {
+				background: var(--surface);
+				border: 1px solid var(--border);
+				border-radius: 12px;
+				padding: 0.45rem 1rem;
+				min-width: 16rem;
+				font-weight: 600;
+				font-variant-numeric: tabular-nums;
+			}
+			body[data-mode='skeptic'] .controls button {
+				font: 700 0.92rem Poppins, system-ui, sans-serif;
+				padding: 0.5rem 1.2rem;
+				border-radius: 8px;
+				border: 1px solid var(--border);
+				background: var(--surface);
+				color: var(--ink);
+				transition: border-color 0.15s;
+			}
+			body[data-mode='skeptic'] .controls button:not(:disabled):hover {
+				border-color: var(--brand);
+			}
+			body[data-mode='skeptic'] #tune:not(:disabled) {
+				background: var(--brand);
+				border-color: var(--brand);
+			}
+			body[data-mode='skeptic'] .controls button:disabled {
+				color: var(--muted);
+			}
+
+			.panels {
 				display: grid;
-				grid-template-columns: auto 1fr;
-				gap: 0.15rem 0.6rem;
-				font-size: 0.9rem;
-				line-height: 1.45;
-				border-left: 2px solid #2a2433;
-				padding-left: 0.75rem;
+				grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+				gap: 0.9rem;
+				padding: 0 2.1rem;
+			}
+			@media (max-width: 900px) {
+				.panels {
+					grid-template-columns: minmax(0, 1fr);
+				}
+			}
+			.panel {
+				background: var(--surface);
+				border: 1.5px solid var(--hairline);
+				border-radius: 12px;
+				padding: 0.9rem 1rem;
+				min-width: 0;
+			}
+			.panel h2 {
+				margin: 0;
+				font-size: 1.02rem;
+			}
+			.panel-note {
+				color: var(--muted);
+				font-size: 0.8rem;
+				margin: 0.25rem 0 0.6rem;
+			}
+			.log {
+				max-height: 26rem;
+				overflow-y: auto;
+			}
+			.log .hint {
+				color: var(--ink-2);
+				margin: 0.4rem 0;
+			}
+			.entry {
+				border-bottom: 1px solid var(--hairline);
+				padding: 0.55rem 0;
+			}
+			.entry .time {
+				color: var(--muted);
+				font-size: 0.8rem;
+				font-variant-numeric: tabular-nums;
+				margin-right: 0.6rem;
+			}
+			.entry .from {
+				color: var(--ink-2);
+				font-size: 0.78rem;
+			}
+			.entry .text {
+				display: block;
+				margin-top: 0.2rem;
 			}
 
-			.time {
+			.debug-log {
+				height: 26rem;
+				overflow: auto;
+				background: #11141c;
+				color: #c9d1e0;
+				border-radius: 8px;
+				padding: 0.6rem 0.7rem;
+				font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+			}
+			.debug-log .line {
+				display: grid;
+				grid-template-columns: auto auto minmax(0, 1fr);
+				white-space: pre-wrap;
+				word-break: break-word;
+			}
+			.debug-log .ts {
+				color: #6b7590;
+				margin-right: 0.6em;
+			}
+			.debug-log .tag {
+				white-space: pre;
+				margin-right: 0.4em;
+				font-weight: 700;
+			}
+			.debug-log .tag-sys .tag {
+				color: #9aa0ab;
+			}
+			.debug-log .tag-stream .tag {
+				color: #6fa8ff;
+			}
+			.debug-log .tag-hop .tag {
+				color: #eeb63f;
+			}
+			.debug-log .tag-play .tag {
+				color: #7fd6a4;
+			}
+			.debug-log .tag-capture .tag {
+				color: #f0a070;
+			}
+			.debug-log .tag-llm .tag {
+				color: #c79bff;
+			}
+			.debug-log .tag-cost .tag {
+				color: #ffd36b;
+			}
+			.debug-log .tag-error .tag,
+			.debug-log .tag-error .msg {
+				color: #ff7b7b;
+			}
+			.debug-log .detail {
+				grid-column: 3;
+				margin: 0.1rem 0 0.3rem 0;
+				padding-left: 1ch;
+				border-left: 2px solid #2c3346;
+				color: #9fb0cc;
+				white-space: pre-wrap;
+				font: inherit;
+			}
+
+			.story {
+				padding: 1.2rem 2.1rem 0.6rem;
+				max-width: 72rem;
+			}
+			.story h2 {
+				font-size: 1.15rem;
+				margin: 1.1rem 0 0.4rem;
+			}
+			.story p,
+			.story li {
+				font-size: 1.12rem;
+				line-height: 1.62;
+				color: var(--ink);
+			}
+			.story ul {
+				margin: 0.4rem 0;
+				padding-left: 1.2rem;
+			}
+			.story li {
+				margin: 0.4rem 0;
+			}
+			.story code {
+				font-family: ui-monospace, Menlo, monospace;
+				font-size: 0.86em;
+				background: var(--surface);
+				border: 1px solid var(--hairline);
+				border-radius: 4px;
+				padding: 0.05em 0.3em;
+			}
+			body[data-mode='skeptic'] footer {
+				border-top: 1px solid var(--hairline);
+				background: var(--surface);
+				padding: 1rem 2.1rem 1.4rem;
+				text-align: center;
+				color: var(--muted);
+				font-size: 0.85rem;
+				margin-top: 2rem;
+			}
+			body[data-mode='skeptic'] footer p {
+				max-width: 68rem;
+				margin: 0.35rem auto;
+			}
+			.colophon {
+				margin-top: 0.35rem;
+				font-size: 0.78rem;
+				opacity: 0.85;
+			}
+			@media (max-width: 640px) {
+				.topnav,
+				.masthead,
+				body[data-mode='skeptic'] .console,
+				.panels,
+				.story {
+					padding-left: 1rem;
+					padding-right: 1rem;
+				}
+				.topnav .vintage {
+					display: none;
+				}
+				.station {
+					min-width: 0;
+					width: 100%;
+				}
+			}
+
+			/* ---------- spooky ---------- */
+			body[data-mode='spooky'] {
+				--void: #07040d;
+				--violet: #b46cff;
+				--ecto: #5dff9a;
+				--ember: #ff8a2a;
+				--mist: #e9defa;
+				--dim: #9c8fb3;
+				color: var(--mist);
+				background:
+					radial-gradient(ellipse 60% 45% at 15% 10%, rgba(180, 108, 255, 0.28), transparent 70%),
+					radial-gradient(ellipse 55% 40% at 90% 85%, rgba(255, 138, 42, 0.18), transparent 70%),
+					radial-gradient(ellipse 70% 50% at 50% 110%, rgba(93, 255, 154, 0.14), transparent 70%),
+					var(--void);
+				background-attachment: fixed;
+			}
+			body[data-mode='spooky']::before {
+				/* slow drifting fog */
+				content: '';
+				position: fixed;
+				inset: -20%;
+				pointer-events: none;
+				background:
+					radial-gradient(circle at 30% 40%, rgba(233, 222, 250, 0.05), transparent 40%),
+					radial-gradient(circle at 70% 60%, rgba(93, 255, 154, 0.04), transparent 35%);
+				animation: drift 38s ease-in-out infinite alternate;
+			}
+			@keyframes drift {
+				to {
+					transform: translate(6%, -4%) scale(1.1);
+				}
+			}
+			body[data-mode='spooky'] a {
+				color: var(--ecto);
+			}
+			body[data-mode='spooky'] .mode-toggle {
+				background: rgba(20, 10, 34, 0.75);
+				border: 1px solid rgba(180, 108, 255, 0.35);
+				backdrop-filter: blur(6px);
+			}
+			body[data-mode='spooky'] .mode-toggle button {
 				color: var(--dim);
-				font-size: 0.75rem;
+			}
+			body[data-mode='spooky'] .mode-toggle button[aria-pressed='true'] {
+				background: var(--violet);
+				color: #12061f;
 			}
 
-			.from {
-				grid-column: 2;
-				color: var(--accent-glow);
-				font-size: 0.75rem;
-				letter-spacing: 0.04em;
+			.spooky-head {
+				text-align: center;
+				padding: 4.5rem 1.5rem 0.5rem;
+				position: relative;
+			}
+			.spooky-head h1 {
+				font-family: Creepster, 'Cormorant Garamond', serif;
+				font-weight: 400;
+				font-size: clamp(3.2rem, 11vw, 6.5rem);
+				letter-spacing: 0.06em;
+				line-height: 1;
+				margin: 0;
+				color: var(--ecto);
+				text-shadow:
+					0 0 18px rgba(93, 255, 154, 0.55),
+					0 0 42px rgba(180, 108, 255, 0.45);
+			}
+			.invocation {
+				font-family: 'Cormorant Garamond', Georgia, serif;
+				font-size: clamp(1.3rem, 3.2vw, 1.9rem);
+				line-height: 1.35;
+				margin: 1.2rem auto 0.4rem;
+				max-width: 34rem;
+			}
+			.hint-small {
+				color: var(--dim);
+				font-size: 0.85rem;
+				letter-spacing: 0.08em;
+				margin: 0;
+			}
+			body[data-mode='spooky'] .console {
+				padding: 1rem 1.5rem 0.5rem;
+				position: relative;
+			}
+			.waveform {
+				width: min(56rem, 100%);
+				height: clamp(7rem, 18vw, 11rem);
+				display: block;
+			}
+			body[data-mode='spooky'] .controls button {
+				font-family: 'Cormorant Garamond', Georgia, serif;
+				font-weight: 600;
+				font-size: clamp(1.25rem, 3vw, 1.6rem);
+				padding: 0.6rem 1.6rem;
+				border-radius: 999px;
+				color: var(--mist);
+				background: rgba(20, 10, 34, 0.7);
+				border: 1.5px solid rgba(180, 108, 255, 0.55);
+				transition:
+					box-shadow 0.2s,
+					border-color 0.2s;
+			}
+			body[data-mode='spooky'] #tune:not(:disabled) {
+				border-color: var(--ember);
+				box-shadow: 0 0 22px rgba(255, 138, 42, 0.45);
+				animation: beckon 2.8s ease-in-out infinite;
+			}
+			body[data-mode='spooky'] .controls button:not(:disabled):hover {
+				border-color: var(--ecto);
+				box-shadow: 0 0 26px rgba(93, 255, 154, 0.5);
+			}
+			body[data-mode='spooky'] .controls button:disabled {
+				color: var(--dim);
+				border-color: rgba(156, 143, 179, 0.3);
+				box-shadow: none;
+				animation: none;
+			}
+			@keyframes beckon {
+				50% {
+					box-shadow: 0 0 38px rgba(255, 138, 42, 0.75);
+				}
 			}
 
-			.text {
-				grid-column: 1 / -1;
+			.oracle {
+				text-align: center;
+				padding: 1.5rem 1.5rem 3rem;
+				position: relative;
+			}
+			.oracle-latest {
+				font-family: 'Cormorant Garamond', Georgia, serif;
+				font-weight: 600;
+				/* readable from across a table */
+				font-size: clamp(2rem, 5.2vw, 4rem);
+				line-height: 1.2;
+				max-width: 60rem;
+				margin: 0 auto;
+				color: #f4ecff;
+				text-shadow: 0 0 24px rgba(180, 108, 255, 0.55);
+			}
+			.oracle-latest.arrive {
+				animation: materialize 2.4s ease-out;
+			}
+			@keyframes materialize {
+				from {
+					opacity: 0;
+					filter: blur(10px);
+					letter-spacing: 0.08em;
+				}
+			}
+			.oracle-earlier {
+				list-style: none;
+				padding: 0;
+				margin: 2rem auto 0;
+				max-width: 46rem;
+				font-family: 'Cormorant Garamond', Georgia, serif;
+				font-size: clamp(1.1rem, 2.4vw, 1.45rem);
+				color: var(--dim);
+			}
+			.oracle-earlier li {
+				margin: 0.7rem 0;
+			}
+			.oracle-earlier li:nth-child(n + 4) {
+				opacity: 0.55;
+			}
+			.spooky-foot {
+				text-align: center;
+				color: var(--dim);
+				font-size: 0.85rem;
+				padding: 1rem 1.5rem 1.6rem;
+				position: relative;
+			}
+			.link-button {
+				font: inherit;
+				color: var(--ecto);
+				background: none;
+				border: 0;
+				padding: 0;
+				text-decoration: underline;
+				cursor: pointer;
+			}
+			@media (prefers-reduced-motion: reduce) {
+				body[data-mode='spooky']::before,
+				body[data-mode='spooky'] #tune:not(:disabled),
+				.oracle-latest.arrive {
+					animation: none;
+				}
 			}
 		</style>
 	</body>

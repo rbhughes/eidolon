@@ -31,14 +31,30 @@ const FADE_S = 0.008;
 // start time is never already in the past by the time start() runs.
 const START_LEAD_S = 0.1;
 
+export interface Scheduled {
+  /** Wall-clock ms when the snippet becomes audible, and when it ends. */
+  audibleAt: number;
+  endsAt: number;
+  seconds: number;
+  decodeMs: number;
+  /** Seconds of audio that were already queued ahead of this snippet. */
+  leadSeconds: number;
+}
+
 export class SnippetPlayer {
   private ctx: AudioContext;
+  /** Everything audible passes through this, so a visualizer can read
+   * the actual output level. */
+  readonly analyser: AnalyserNode;
   private nextStartTime = 0;
   private generation = 0;
   private scheduled = new Set<AudioBufferSourceNode>();
 
   constructor() {
     this.ctx = new AudioContext();
+    this.analyser = this.ctx.createAnalyser();
+    this.analyser.fftSize = 2048;
+    this.analyser.connect(this.ctx.destination);
   }
 
   /** Must be called from a user-gesture handler (e.g. the tune-in click)
@@ -55,16 +71,17 @@ export class SnippetPlayer {
 
   /**
    * Decode and schedule a snippet right after whatever is already queued.
-   * Resolves with the wall-clock time (ms) it becomes audible, or null if
-   * it couldn't be decoded or stop() was called meanwhile.
+   * Resolves with when it plays (see Scheduled), or null if it couldn't
+   * be decoded or stop() was called meanwhile.
    */
-  async play(snippet: Snippet): Promise<number | null> {
+  async play(snippet: Snippet): Promise<Scheduled | null> {
     const gen = this.generation;
     const bytes = new Uint8Array(snippet.primer.length + snippet.audio.length);
     bytes.set(snippet.primer, 0);
     bytes.set(snippet.audio, snippet.primer.length);
 
     let decoded: AudioBuffer;
+    const decodeStart = performance.now();
     try {
       // decodeAudioData detaches its input -- `bytes` is our own copy.
       decoded = await this.ctx.decodeAudioData(bytes.buffer);
@@ -72,6 +89,7 @@ export class SnippetPlayer {
       return null;
     }
     if (gen !== this.generation) return null;
+    const decodeMs = performance.now() - decodeStart;
 
     const duration = Math.min(snippet.seconds, decoded.duration - snippet.primerSeconds);
     if (duration <= 0) return null;
@@ -84,7 +102,7 @@ export class SnippetPlayer {
     gain.gain.linearRampToValueAtTime(1, startAt + FADE_S);
     gain.gain.setValueAtTime(1, startAt + duration - FADE_S);
     gain.gain.linearRampToValueAtTime(0, startAt + duration);
-    gain.connect(this.ctx.destination);
+    gain.connect(this.analyser);
 
     const source = this.ctx.createBufferSource();
     source.buffer = decoded;
@@ -93,11 +111,13 @@ export class SnippetPlayer {
       this.scheduled.delete(source);
       gain.disconnect();
     };
+    const leadSeconds = Math.max(0, this.nextStartTime - now);
     source.start(startAt, snippet.primerSeconds, duration);
     this.scheduled.add(source);
     this.nextStartTime = startAt + duration;
 
-    return Date.now() + (startAt - now) * 1000;
+    const audibleAt = Date.now() + (startAt - now) * 1000;
+    return { audibleAt, endsAt: audibleAt + duration * 1000, seconds: duration, decodeMs, leadSeconds };
   }
 
   /** Silence everything scheduled and forget the queue. */

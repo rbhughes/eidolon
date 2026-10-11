@@ -76,6 +76,8 @@ export interface Snippet {
   audio: Uint8Array;
   primerSeconds: number;
   seconds: number;
+  frames: number;
+  primerFrames: number;
 }
 
 interface PlayedSnippet {
@@ -105,8 +107,24 @@ const MAX_STALENESS_MS = 2_000;
 
 const STREAM_RECONNECT_DELAY_MS = 1_000;
 
+/** Behind-the-scenes events, for the page's debug log. */
+export type BufferEvent =
+  | { kind: 'connected' }
+  | { kind: 'first-audio'; station: Station }
+  | { kind: 'disconnected'; reason: string };
+
+export interface StationStats {
+  station: Station;
+  /** Average over the last STATS_WINDOW_MS. */
+  kbps: number;
+  bufferedSeconds: number;
+}
+
+const STATS_WINDOW_MS = 10_000;
+
 export class StationBuffer {
   private perStation = new Map<string, StationState>();
+  private onEvent: (e: BufferEvent) => void = () => {};
   private controller: AbortController | null = null;
   private played: PlayedSnippet[] = [];
   private readonly windowMs: number;
@@ -128,6 +146,23 @@ export class StationBuffer {
   stop(): void {
     this.controller?.abort();
     this.controller = null;
+  }
+
+  setEventSink(fn: (e: BufferEvent) => void): void {
+    this.onEvent = fn;
+  }
+
+  /** Per-station receive rate and how much is buffered right now. */
+  stats(stations: Station[]): StationStats[] {
+    const now = Date.now();
+    return stations.map((station) => {
+      const chunks = this.perStation.get(station.id)?.chunks ?? [];
+      let recent = 0;
+      for (const c of chunks) if (now - c.t <= STATS_WINDOW_MS) recent += c.bytes.length;
+      const kbps = (recent * 8) / STATS_WINDOW_MS;
+      const span = chunks.length ? (now - chunks[0].t) / 1000 : 0;
+      return { station, kbps, bufferedSeconds: span };
+    });
   }
 
   /**
@@ -191,7 +226,9 @@ export class StationBuffer {
       primer: tail.slice(frames[primerStart].offset, audioStart),
       audio: tail.slice(audioStart, audioEnd),
       primerSeconds,
-      seconds
+      seconds,
+      frames: frames.length - start,
+      primerFrames: start - primerStart
     };
   }
 
@@ -233,12 +270,17 @@ export class StationBuffer {
       const res = await fetch('/api/stream', { signal });
       if (!res.body) return;
       reader = res.body.getReader();
+      this.onEvent({ kind: 'connected' });
+      const heard = new Set<string>();
 
       let buf = new Uint8Array(0);
 
       while (!signal.aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          this.onEvent({ kind: 'disconnected', reason: 'server ended the stream' });
+          break;
+        }
         if (value && value.length) {
           const merged = new Uint8Array(buf.length + value.length);
           merged.set(buf, 0);
@@ -260,6 +302,10 @@ export class StationBuffer {
 
           const station = stations[stationIndex];
           if (!station) continue;
+          if (!heard.has(station.id)) {
+            heard.add(station.id);
+            this.onEvent({ kind: 'first-audio', station });
+          }
 
           const state = this.perStation.get(station.id)!;
           state.chunks.push({ bytes: payload, t: Date.now(), pos: state.received });
@@ -267,7 +313,8 @@ export class StationBuffer {
           this.trim(state.chunks);
         }
       }
-    } catch {
+    } catch (err) {
+      if (!signal.aborted) this.onEvent({ kind: 'disconnected', reason: String(err) });
       // Aborted at stop(), a network hiccup, or a malformed frame --
       // demux() reconnects unless we were stopped.
     } finally {

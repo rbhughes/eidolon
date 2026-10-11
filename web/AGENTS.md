@@ -13,12 +13,12 @@ Manage the background server with `astro dev stop`, `astro dev status`, and `ast
 `npm run build` regenerate it automatically via `predev`/`prebuild`, but
 restarting straight through `astro dev --background` (the convention
 above) does not -- run `npm run generate-types` by hand first after
-changing `wrangler.jsonc` bindings. (Pre-existing, unrelated: `astro check`
-has had 5 DOM-lib-collision errors in `index.astro`'s `<script>` block
-since before any binding work -- `@astrojs/cloudflare`'s own
-`@cloudflare/workers-types` dependency redefines globals like
-`Element.prepend` project-wide, regardless of whether this generated file
-is in scope. Not fixed; flagging so it isn't mistaken for a regression.)
+changing `wrangler.jsonc` bindings. (`@astrojs/cloudflare`'s own
+`@cloudflare/workers-types` dependency redefines DOM globals like
+`Element.append`/`prepend` project-wide, regardless of whether this
+generated file is in scope -- so client code uses `appendChild` /
+`insertBefore` instead, and `astro check` is clean at 0 errors. Keep it
+that way: a new error there is a real regression.)
 
 ## Documentation
 
