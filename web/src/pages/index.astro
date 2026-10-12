@@ -34,7 +34,7 @@ const stationNames = STATIONS.map((s) => s.name);
 	<body data-mode="spooky">
 		<script is:inline>
 			// Pick the mode before first paint so a saved "skeptic" doesn't
-			// flash the spooky page first. The module script re-derives it.
+			// flash the spooky page first. The module script reads it back.
 			(function () {
 				var m = location.hash.slice(1);
 				if (m !== 'skeptic' && m !== 'spooky') {
@@ -187,6 +187,8 @@ const stationNames = STATIONS.map((s) => s.name);
 
 		<script>
 			import { STATIONS, pickWeighted } from '../data/stations';
+			import { concatBytes } from '../lib/bytes';
+			import type { TranscribeDebug, TranscribeResponse } from '../lib/openrouter';
 			import { StationBuffer } from '../lib/stationBuffer';
 			import { SnippetPlayer } from '../lib/snippetPlayer';
 			import { DebugLog } from '../lib/debugLog';
@@ -230,7 +232,7 @@ const stationNames = STATIONS.map((s) => s.name);
 			const SNIPPET_S = 2;
 			const MIN_SNIPPET_S = 1;
 			// Queue the next snippet once less than this much is left playing
-			// -- decoding a 3s snippet takes milliseconds, so this is pure
+			// -- decoding a snippet takes milliseconds, so this is pure
 			// margin against timer jitter.
 			const QUEUE_AHEAD_S = 0.75;
 			const TICK_MS = 100;
@@ -265,18 +267,6 @@ const stationNames = STATIONS.map((s) => s.name);
 			const num = (o: Record<string, unknown> | undefined, k: string) => (typeof o?.[k] === 'number' ? (o[k] as number) : 0);
 
 			// --- mode -------------------------------------------------------
-
-			function initialMode(): Mode {
-				const fromHash = location.hash.slice(1);
-				if (fromHash === 'skeptic' || fromHash === 'spooky') return fromHash;
-				try {
-					const saved = localStorage.getItem(MODE_KEY);
-					if (saved === 'skeptic' || saved === 'spooky') return saved;
-				} catch {
-					// Storage blocked -- default is fine.
-				}
-				return 'spooky';
-			}
 
 			function setMode(next: Mode) {
 				mode = next;
@@ -380,7 +370,7 @@ const stationNames = STATIONS.map((s) => s.name);
 
 			function logStats() {
 				const parts = buffer
-					.stats(STATIONS)
+					.stats()
 					.map((s) => `${s.station.name} ${s.kbps.toFixed(0)}`)
 					.join(' · ');
 				debug.log('stream', `receive rate, kbps: ${parts}`);
@@ -388,7 +378,7 @@ const stationNames = STATIONS.map((s) => s.name);
 
 			function startHopping() {
 				hopping = true;
-				buffer.start(STATIONS);
+				buffer.start();
 				stationEl.textContent = '-- listening --';
 				statsTimer = setInterval(logStats, STATS_INTERVAL_MS);
 				void hopLoop(++hopLoopGeneration);
@@ -515,13 +505,8 @@ const stationNames = STATIONS.map((s) => s.name);
 				}
 				const labelSummary = labels.join(' -> ');
 
-				const totalLen = chunks.reduce((n, c) => n + c.bytes.length, 0);
-				const combined = new Uint8Array(totalLen);
-				let offset = 0;
-				for (const c of chunks) {
-					combined.set(c.bytes, offset);
-					offset += c.bytes.length;
-				}
+				const combined = concatBytes(chunks.map((c) => c.bytes));
+				const totalLen = combined.length;
 
 				const formData = new FormData();
 				formData.append('file', new Blob([combined as BlobPart], { type: 'audio/mpeg' }), 'clip.mp3');
@@ -538,9 +523,7 @@ const stationNames = STATIONS.map((s) => s.name);
 
 				try {
 					const res = await fetch('/api/transcribe', { method: 'POST', body: formData, signal: abort.signal });
-					const data = (await res.json()) as
-						| { ok: true; text: string; timestamp: string; debug: ModelDebug }
-						| { ok: false; error: string };
+					const data = (await res.json()) as TranscribeResponse;
 					const roundTrip = performance.now() - fetchStart;
 					if (data.ok) {
 						logModelCalls(data.debug, roundTrip);
@@ -566,29 +549,11 @@ const stationNames = STATIONS.map((s) => s.name);
 				}
 			});
 
-			interface ModelDebug {
-				clipBytes: number;
-				transcription: { model: string; ms: number; attempts: number; usage?: Record<string, unknown>; rawText: string };
-				translation:
-					| null
-					| { error: string }
-					| {
-							model: string;
-							provider?: string;
-							ms: number;
-							attempts: number;
-							usage?: Record<string, unknown>;
-							systemPrompt: string;
-							input: string;
-							text: string;
-					  };
-			}
-
 			// A backup request is sent when an attempt hangs (see hedge.ts);
 			// say so, since only the winning attempt's usage is reported.
 			const attemptsNote = (n: number) => (n > 1 ? ` [${n} requests: the first stalled, a backup answered]` : '');
 
-			function logModelCalls(d: ModelDebug, roundTripMs: number) {
+			function logModelCalls(d: TranscribeDebug, roundTripMs: number) {
 				const t = d.transcription;
 				debug.log('llm', `-> ${t.model} (server-side): ${fmtBytes(d.clipBytes)} of MP3`);
 				const tCost = num(t.usage, 'cost');
@@ -628,7 +593,9 @@ const stationNames = STATIONS.map((s) => s.name);
 				);
 			}
 
-			setMode(initialMode());
+			// The inline script at the top of <body> already chose it (hash, then
+			// saved choice, then spooky) before first paint.
+			setMode(document.body.dataset.mode as Mode);
 			// Idle shimmer from the start; it swells once there's audio.
 			waveform.start();
 			debug.log('sys', `page ready: ${STATIONS.length} stations configured, waiting for tune in`);

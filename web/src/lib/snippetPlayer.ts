@@ -24,6 +24,7 @@
 // play() calls must not overlap: await each before the next, so snippets
 // queue in order.
 
+import { concatBytes } from './bytes';
 import type { Snippet } from './stationBuffer';
 
 const FADE_S = 0.008;
@@ -76,9 +77,7 @@ export class SnippetPlayer {
    */
   async play(snippet: Snippet): Promise<Scheduled | null> {
     const gen = this.generation;
-    const bytes = new Uint8Array(snippet.primer.length + snippet.audio.length);
-    bytes.set(snippet.primer, 0);
-    bytes.set(snippet.audio, snippet.primer.length);
+    const bytes = concatBytes([snippet.primer, snippet.audio]);
 
     let decoded: AudioBuffer;
     const decodeStart = performance.now();

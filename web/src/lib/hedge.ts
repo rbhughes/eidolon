@@ -17,8 +17,6 @@ export interface HedgeOptions {
   hedgeAfterMs: number;
   /** Give up entirely after this long. */
   timeoutMs: number;
-  /** Total attempts allowed, backups and retries included. */
-  maxAttempts?: number;
   /** Fires when the caller no longer wants the result (visitor pressed stop). */
   cancel?: AbortSignal;
   /** Whether a failed attempt is worth a replacement. */
@@ -29,16 +27,16 @@ export interface HedgeResult<T> {
   value: T;
   /** Attempts started (1 = the first one answered on its own). */
   attempts: number;
-  /** Which attempt's answer was used, 1-based. */
-  winner: number;
 }
 
 export class HedgeTimeoutError extends Error {
   readonly name = 'AbortError';
 }
 
+// Total attempts allowed, backups and retries included.
+const MAX_ATTEMPTS = 2;
+
 export function hedged<T>(attempt: (signal: AbortSignal) => Promise<T>, opts: HedgeOptions): Promise<HedgeResult<T>> {
-  const maxAttempts = opts.maxAttempts ?? 2;
   const retryable = opts.retryable ?? (() => true);
 
   return new Promise((resolve, reject) => {
@@ -58,17 +56,16 @@ export function hedged<T>(attempt: (signal: AbortSignal) => Promise<T>, opts: He
     };
 
     const start = () => {
-      if (settled || controllers.length >= maxAttempts) return;
+      if (settled || controllers.length >= MAX_ATTEMPTS) return;
       const controller = new AbortController();
       controllers.push(controller);
-      const n = controllers.length;
       running++;
       attempt(controller.signal).then(
-        (value) => finish(() => resolve({ value, attempts: controllers.length, winner: n })),
+        (value) => finish(() => resolve({ value, attempts: controllers.length })),
         (err) => {
           running--;
           if (settled) return;
-          if (retryable(err) && controllers.length < maxAttempts) {
+          if (retryable(err) && controllers.length < MAX_ATTEMPTS) {
             clearTimeout(hedgeTimer); // the replacement starts now
             start();
           } else if (running === 0) {

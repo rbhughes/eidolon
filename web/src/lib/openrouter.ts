@@ -1,5 +1,5 @@
-// Server-side only (Cloudflare Pages Function / Astro API route). Ports
-// spiritbox's transcribe.py / translate.py to the webapp, with one
+// Server-side only (Astro API route on the Worker). Ports spiritbox's
+// openrouter.py to the webapp, with one
 // deliberate difference: there's no ffmpeg here, so raw mp3 bytes read
 // straight off a station stream are sent to OpenRouter as-is -- verified
 // empirically that voxtral-mini-transcribe accepts them directly.
@@ -65,21 +65,35 @@ export interface TranslateResult extends CallInfo {
   input: string;
 }
 
-async function transcribeOnce(apiKey: string, bytes: Uint8Array, signal: AbortSignal) {
-  // Built per attempt: a request body can only be sent once.
-  const form = new FormData();
-  form.append('file', new Blob([bytes as BlobPart], { type: 'audio/mpeg' }), 'chunk.mp3');
-  form.append('model', TRANSCRIBE_MODEL);
-  const resp = await fetch(TRANSCRIBE_ENDPOINT, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-    signal
-  });
+/** What /api/transcribe's `debug` field carries: everything the page's
+ * debug log shows about the model calls. */
+export interface TranscribeDebug {
+  clipBytes: number;
+  transcription: Omit<TranscribeResult, 'text'> & { rawText: string };
+  /** null: nothing to translate (empty transcript). */
+  translation: TranslateResult | { error: string } | null;
+}
+
+export type TranscribeResponse =
+  | { ok: true; text: string; timestamp: string; debug: TranscribeDebug }
+  | { ok: false; error: string };
+
+/** One POST to OpenRouter; any non-2xx becomes an OpenRouterError. */
+async function post<T>(what: string, url: string, apiKey: string, body: BodyInit, signal: AbortSignal, contentType?: string): Promise<T> {
+  const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
+  if (contentType) headers['Content-Type'] = contentType;
+  const resp = await fetch(url, { method: 'POST', headers, body, signal });
   if (!resp.ok) {
-    throw new OpenRouterError(`transcription HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`, resp.status);
+    throw new OpenRouterError(`${what} HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`, resp.status);
   }
-  return (await resp.json()) as { text?: string; usage?: Record<string, unknown> };
+  return (await resp.json()) as T;
+}
+
+/** Run `once` hedged (see hedge.ts), timing the whole thing. */
+async function timedHedged<T>(once: (signal: AbortSignal) => Promise<T>, hedgeAfterMs: number, timeoutMs: number, cancel?: AbortSignal) {
+  const started = Date.now();
+  const { value, attempts } = await hedged(once, { hedgeAfterMs, timeoutMs, cancel, retryable });
+  return { data: value, attempts, ms: Date.now() - started };
 }
 
 export async function transcribeMp3(
@@ -88,43 +102,19 @@ export async function transcribeMp3(
   timeoutMs = 20_000,
   cancel?: AbortSignal
 ): Promise<TranscribeResult> {
-  const started = Date.now();
-  const { value: data, attempts } = await hedged((signal) => transcribeOnce(apiKey, bytes, signal), {
-    hedgeAfterMs: TRANSCRIBE_HEDGE_MS,
-    timeoutMs,
-    cancel,
-    retryable
-  });
-  return { text: data.text ?? '', model: TRANSCRIBE_MODEL, ms: Date.now() - started, usage: data.usage, attempts };
-}
-
-async function translateOnce(apiKey: string, text: string, signal: AbortSignal) {
-  const resp = await fetch(CHAT_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
+  const { data, attempts, ms } = await timedHedged(
+    (signal) => {
+      // Built per attempt: a request body can only be sent once.
+      const form = new FormData();
+      form.append('file', new Blob([bytes as BlobPart], { type: 'audio/mpeg' }), 'chunk.mp3');
+      form.append('model', TRANSCRIBE_MODEL);
+      return post<{ text?: string; usage?: Record<string, unknown> }>('transcription', TRANSCRIBE_ENDPOINT, apiKey, form, signal);
     },
-    body: JSON.stringify({
-      model: TRANSLATE_MODEL,
-      messages: [
-        { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
-        { role: 'user', content: text }
-      ],
-      temperature: 0,
-      // Ask OpenRouter to include the call's actual cost in `usage`.
-      usage: { include: true }
-    }),
-    signal
-  });
-  if (!resp.ok) {
-    throw new OpenRouterError(`translation HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`, resp.status);
-  }
-  return (await resp.json()) as {
-    choices?: { message?: { content?: string } }[];
-    provider?: string;
-    usage?: Record<string, unknown>;
-  };
+    TRANSCRIBE_HEDGE_MS,
+    timeoutMs,
+    cancel
+  );
+  return { text: data.text ?? '', model: TRANSCRIBE_MODEL, ms, usage: data.usage, attempts };
 }
 
 export async function translateToEnglish(
@@ -133,20 +123,34 @@ export async function translateToEnglish(
   timeoutMs = 15_000,
   cancel?: AbortSignal
 ): Promise<TranslateResult> {
-  const started = Date.now();
-  const { value: data, attempts } = await hedged((signal) => translateOnce(apiKey, text, signal), {
-    hedgeAfterMs: TRANSLATE_HEDGE_MS,
-    timeoutMs,
-    cancel,
-    retryable
+  const body = JSON.stringify({
+    model: TRANSLATE_MODEL,
+    messages: [
+      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
+      { role: 'user', content: text }
+    ],
+    temperature: 0,
+    // Ask OpenRouter to include the call's actual cost in `usage`.
+    usage: { include: true }
   });
+  const { data, attempts, ms } = await timedHedged(
+    (signal) =>
+      post<{
+        choices?: { message?: { content?: string } }[];
+        provider?: string;
+        usage?: Record<string, unknown>;
+      }>('translation', CHAT_ENDPOINT, apiKey, body, signal, 'application/json'),
+    TRANSLATE_HEDGE_MS,
+    timeoutMs,
+    cancel
+  );
   return {
     text: data.choices?.[0]?.message?.content?.trim() ?? text,
     systemPrompt: TRANSLATE_SYSTEM_PROMPT,
     input: text,
     model: TRANSLATE_MODEL,
     provider: data.provider,
-    ms: Date.now() - started,
+    ms,
     usage: data.usage,
     attempts
   };

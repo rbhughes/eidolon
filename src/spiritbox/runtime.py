@@ -18,11 +18,14 @@ import threading
 import time
 import wave
 from collections import deque
-from datetime import datetime
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
+from itertools import groupby
 from pathlib import Path
+
+from spiritbox.dedup import DuplicateDetector
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATE_DIR = PROJECT_ROOT / ".run"
@@ -36,6 +39,7 @@ STREAMS_FILE = PROJECT_ROOT / "streams.json"
 
 DEFAULT_FREQ = "100.0M"
 DEFAULT_VOLUME = 65536  # PulseAudio/PipeWire "normal" (unity) volume
+DEFAULT_BAND = (88.0e6, 108.0e6)  # US FM broadcast band
 RF_SAMPLE_RATE_ARG = "200k"
 AUDIO_RATE_ARG = "48k"
 AUDIO_RATE_HZ = 48000
@@ -46,8 +50,20 @@ FM_CHANNEL_SPACING_HZ = 200_000
 FM_CHANNEL_BASE_HZ = 88_100_000
 
 
-def _rtl_fm_cmd(freq: str) -> list[str]:
+def rtl_fm_cmd(freq: str) -> list[str]:
     return ["rtl_fm", "-f", freq, "-M", "fm", "-s", RF_SAMPLE_RATE_ARG, "-r", AUDIO_RATE_ARG, "-"]
+
+
+def _paplay_cmd(volume: int, client_name: str) -> list[str]:
+    return [
+        "paplay",
+        "--raw",
+        f"--rate={AUDIO_RATE_HZ}",
+        "--format=s16le",
+        "--channels=1",
+        f"--client-name={client_name}",
+        f"--volume={volume}",
+    ]
 
 
 def _ffmpeg_stream_cmd(url: str) -> list[str]:
@@ -79,7 +95,7 @@ def _random_valid_channel(band: tuple[float, float]) -> float:
 
 
 def scan(
-    band: tuple[float, float] = (88.0e6, 108.0e6),
+    band: tuple[float, float] = DEFAULT_BAND,
     resolution_hz: float = 50_000,
     integration_seconds: int = 20,
     min_db_above_median: float = 6.0,
@@ -87,7 +103,6 @@ def scan(
 ) -> list[dict]:
     """Sweep `band` with rtl_power and save the strongest peaks as hotspots
     for sweep() to bias hops towards. Returns the peaks found."""
-    import csv
     import tempfile
 
     low, high = band
@@ -133,13 +148,21 @@ def scan(
     return peaks
 
 
-def load_hotspots() -> list[dict]:
-    if not HOTSPOTS_FILE.exists():
-        return []
+def _load_json(path: Path):
+    """The file's parsed contents, or None if it's missing or unreadable."""
     try:
-        return json.loads(HOTSPOTS_FILE.read_text())
+        return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
-        return []
+        return None
+
+
+def load_hotspots() -> list[dict]:
+    return _load_json(HOTSPOTS_FILE) or []
+
+
+def load_streams() -> list[dict]:
+    """Load the configured internet radio stations (see STREAMS_FILE)."""
+    return _load_json(STREAMS_FILE) or []
 
 
 def _make_hop_picker(source: str, band: tuple[float, float], hotspot_bias: float) -> Callable[[], tuple[str, list[str]]]:
@@ -165,7 +188,7 @@ def _make_hop_picker(source: str, band: tuple[float, float], hotspot_bias: float
         else:
             freq_hz = _random_valid_channel(band)
         freq = f"{freq_hz / 1e6:.1f}M"
-        return freq, _rtl_fm_cmd(freq)
+        return freq, rtl_fm_cmd(freq)
 
     return _next_hop
 
@@ -193,22 +216,17 @@ def _capture_chunk(cmd: list[str], chunk_bytes_target: int, player_stdin, max_wa
                     pass
     finally:
         watchdog.cancel()
-        proc.terminate()
-        try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_process(proc, timeout=1)
     return bytes(collected)
 
 
-def load_streams() -> list[dict]:
-    """Load the configured internet radio stations (see STREAMS_FILE)."""
-    if not STREAMS_FILE.exists():
-        return []
+def _stop_process(proc: subprocess.Popen, timeout: float) -> None:
+    """Terminate a child we started, killing it if it doesn't exit in time."""
+    proc.terminate()
     try:
-        return json.loads(STREAMS_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return []
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _pcm_to_wav_bytes(pcm: bytes, rate: int = AUDIO_RATE_HZ) -> bytes:
@@ -229,23 +247,9 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_state() -> dict | None:
-    if not STATE_FILE.exists():
-        return None
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _write_state(data: dict) -> None:
-    STATE_DIR.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data))
-
-
 def is_running() -> dict | None:
     """Return the current session's state if both processes are still alive."""
-    state = _read_state()
+    state = _load_json(STATE_FILE)
     if state is None:
         return None
     if _pid_alive(state["rtl_fm_pid"]) and _pid_alive(state["player_pid"]):
@@ -260,22 +264,14 @@ def start(freq: str = DEFAULT_FREQ, volume: int = DEFAULT_VOLUME) -> dict:
         raise RuntimeError(f"already running at {existing['freq']} -- run stop first")
 
     rtl_fm = subprocess.Popen(
-        _rtl_fm_cmd(freq),
+        rtl_fm_cmd(freq),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     assert rtl_fm.stdout is not None
     player = subprocess.Popen(
-        [
-            "paplay",
-            "--raw",
-            f"--rate={AUDIO_RATE_HZ}",
-            "--format=s16le",
-            "--channels=1",
-            "--client-name=spiritbox",
-            f"--volume={volume}",
-        ],
+        _paplay_cmd(volume, "spiritbox"),
         stdin=rtl_fm.stdout,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -289,7 +285,8 @@ def start(freq: str = DEFAULT_FREQ, volume: int = DEFAULT_VOLUME) -> dict:
         "player_pid": player.pid,
         "started_at": time.time(),
     }
-    _write_state(state)
+    STATE_DIR.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state))
     return state
 
 
@@ -312,7 +309,7 @@ def _terminate(pid: int, timeout: float = 2.0) -> None:
 
 
 def stop() -> dict | None:
-    state = _read_state()
+    state = _load_json(STATE_FILE)
     if state is None:
         return None
     _terminate(state["player_pid"])
@@ -325,7 +322,7 @@ def record(path: Path, seconds: float, freq: str = DEFAULT_FREQ) -> Path:
     if is_running() is not None:
         raise RuntimeError("live monitor is running -- run stop first")
 
-    proc = subprocess.Popen(_rtl_fm_cmd(freq), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(rtl_fm_cmd(freq), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     assert proc.stdout is not None
 
     chunks: list[bytes] = []
@@ -337,11 +334,7 @@ def record(path: Path, seconds: float, freq: str = DEFAULT_FREQ) -> Path:
                 break
             chunks.append(chunk)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_process(proc, timeout=2)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_pcm_to_wav_bytes(b"".join(chunks)))
@@ -358,6 +351,10 @@ class _BufferedChunk:
 
 def _fmt_clock(epoch_seconds: float) -> str:
     return datetime.fromtimestamp(epoch_seconds).strftime("%H:%M:%S")
+
+
+def _ignore(*_args) -> None:
+    pass
 
 
 class SweepSession:
@@ -384,7 +381,7 @@ class SweepSession:
     def __init__(
         self,
         chunk_seconds: float = 1.5,
-        band: tuple[float, float] = (88.0e6, 108.0e6),
+        band: tuple[float, float] = DEFAULT_BAND,
         hotspot_bias: float = 0.6,
         volume: int = DEFAULT_VOLUME,
         source: str = "sdr",
@@ -392,9 +389,9 @@ class SweepSession:
         dedup: bool = True,
         dedup_window_seconds: float = 120.0,
         translate: bool = True,
-        on_chunk: Callable[[str, int], None] | None = None,
-        on_transcript: Callable[[str, str, str], None] | None = None,
-        on_profile: Callable[[str, int, bool], None] | None = None,
+        on_chunk: Callable[[str, int], None] = _ignore,
+        on_transcript: Callable[[str, str, str], None] = _ignore,
+        on_profile: Callable[[str, int, bool], None] = _ignore,
     ) -> None:
         if is_running() is not None:
             raise RuntimeError("live monitor is running -- run stop first")
@@ -416,25 +413,10 @@ class SweepSession:
         self._last_mark_time = time.time()
         self._history: list[tuple[str, str, str]] = []
         self._history_lock = threading.Lock()
-
-        from spiritbox import dedup as dedup_module  # local import: keep OpenRouter optional for non-sweep commands
-        from spiritbox import transcribe
-        from spiritbox import translate as translate_module
-
-        self._transcribe = transcribe
-        self._translate_module = translate_module
-        self._dup_detector = dedup_module.DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
+        self._dup_detector = DuplicateDetector(window_seconds=dedup_window_seconds) if dedup else None
 
         self._player = subprocess.Popen(
-            [
-                "paplay",
-                "--raw",
-                f"--rate={AUDIO_RATE_HZ}",
-                "--format=s16le",
-                "--channels=1",
-                "--client-name=spiritbox-sweep",
-                f"--volume={volume}",
-            ],
+            _paplay_cmd(volume, "spiritbox-sweep"),
             stdin=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
@@ -451,14 +433,12 @@ class SweepSession:
 
         while not self._stop_event.is_set():
             label, cmd = self._next_hop()
-            if self._on_chunk is not None:
-                self._on_chunk(label, self._index)
+            self._on_chunk(label, self._index)
 
             pcm = _capture_chunk(cmd, chunk_bytes_target, self._player.stdin, max_chunk_wait)
             t_end = time.time()
             is_dup = self._dup_detector.check(pcm) if self._dup_detector is not None else False
-            if self._on_profile is not None:
-                self._on_profile(label, self._index, is_dup)
+            self._on_profile(label, self._index, is_dup)
 
             with self._buffer_lock:
                 self._buffer.append(_BufferedChunk(label=label, pcm=pcm, t_end=t_end, is_duplicate=is_dup))
@@ -482,24 +462,17 @@ class SweepSession:
             chunks = [c for c in self._buffer if c.t_end >= cutoff]
 
         if not chunks:
-            if self._on_transcript is not None:
-                self._on_transcript(timestamp, "(nothing buffered yet)", "")
+            self._on_transcript(timestamp, "(nothing buffered yet)", "")
             return
 
-        clean_chunks = [c for c in chunks if not c.is_duplicate]
-        if not clean_chunks:
-            if self._on_transcript is not None:
-                self._on_transcript(timestamp, "(skipped: buffered audio was all duplicate/looping)", "")
+        chunks = [c for c in chunks if not c.is_duplicate]
+        if not chunks:
+            self._on_transcript(timestamp, "(skipped: buffered audio was all duplicate/looping)", "")
             return
-        chunks = clean_chunks
 
         pcm = b"".join(c.pcm for c in chunks)
-
-        labels: list[str] = []
-        for c in chunks:
-            if not labels or labels[-1] != c.label:
-                labels.append(c.label)
-        label_summary = " -> ".join(labels)
+        # Consecutive chunks from the same station collapse to one label.
+        label_summary = " -> ".join(label for label, _ in groupby(c.label for c in chunks))
 
         self._executor.submit(self._transcribe_and_report, _pcm_to_wav_bytes(pcm), label_summary, timestamp)
 
@@ -510,22 +483,23 @@ class SweepSession:
             return list(self._history)
 
     def _transcribe_and_report(self, wav_bytes: bytes, label_summary: str, timestamp: str) -> None:
+        from spiritbox import openrouter  # local import: keeps httpx off the path of every other command
+
         try:
-            text = self._transcribe.transcribe_wav(wav_bytes)
+            text = openrouter.transcribe_wav(wav_bytes)
         except Exception as exc:  # noqa: BLE001 -- surface any failure as a transcript line
             text = f"[transcription failed: {exc}]"
         else:
             if self._translate and text.strip():
                 try:
-                    text = self._translate_module.translate_to_english(text)
+                    text = openrouter.translate_to_english(text)
                 except Exception as exc:  # noqa: BLE001 -- keep the original transcript if translation fails
                     text = f"{text} [translation failed: {exc}]"
 
         with self._history_lock:
             self._history.append((timestamp, label_summary, text))
 
-        if self._on_transcript is not None:
-            self._on_transcript(timestamp, label_summary, text)
+        self._on_transcript(timestamp, label_summary, text)
 
     def stop(self) -> None:
         self._stop_event.set()

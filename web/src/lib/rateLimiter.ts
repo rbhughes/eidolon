@@ -1,7 +1,7 @@
-import { DurableObject } from 'cloudflare:workers';
+import { DurableObject, env } from 'cloudflare:workers';
 
 // Per-client rate limiter: one Durable Object per client key (see
-// rateLimit.ts), holding a sliding log of that client's recent hits.
+// checkRateLimit below), holding a sliding log of that client's recent hits.
 //
 // Replaces Cloudflare's native Rate Limiting binding, whose counts are
 // "local to the Cloudflare location" and "eventually consistent" -- per
@@ -46,4 +46,20 @@ export class RateLimiter extends DurableObject<Env> {
   async alarm(): Promise<void> {
     await this.ctx.storage.deleteAll();
   }
+}
+
+// Routes each request to its client's RateLimiter.
+//
+// Keyed on cf-connecting-ip, the header Cloudflare's edge sets to the
+// real client IP (and what @astrojs/cloudflare's own getClientAddress()
+// reads). It survives the ghost-pages proxy, which forwards the request
+// untouched. Unset in local dev -- falls back to a constant key, a single
+// shared bucket, appropriate for one developer testing locally.
+export async function checkRateLimit(bucket: Bucket, request: Request): Promise<boolean> {
+  const key = request.headers.get('cf-connecting-ip') ?? 'local-dev';
+  return env.RATE_LIMITER.getByName(key).hit(bucket);
+}
+
+export function rateLimitedResponse(body: Record<string, unknown>): Response {
+  return Response.json(body, { status: 429, headers: { 'retry-after': '60' } });
 }

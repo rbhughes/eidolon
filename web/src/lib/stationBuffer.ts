@@ -1,4 +1,4 @@
-// Browser-side only. Mirrors the CLI's ScrubSession ring buffer, but
+// Browser-side only. Mirrors the CLI's SweepSession ring buffer, but
 // learned several hard lessons about how to actually fetch the stations:
 //
 // 1. Reconnecting a station's proxy fetch on every hop is wrong: these
@@ -43,13 +43,9 @@
 // since() returns exactly those snippets' bytes -- the very same arrays
 // that were decoded for playback, never a re-derivation from timestamps.
 
+import type { Station } from '../data/stations';
+import { concatBytes } from './bytes';
 import { parseFrames } from './mp3';
-
-export interface Station {
-  id: string;
-  name: string;
-  url: string;
-}
 
 interface RawChunk {
   bytes: Uint8Array;
@@ -117,7 +113,6 @@ export interface StationStats {
   station: Station;
   /** Average over the last STATS_WINDOW_MS. */
   kbps: number;
-  bufferedSeconds: number;
 }
 
 const STATS_WINDOW_MS = 10_000;
@@ -127,20 +122,23 @@ export class StationBuffer {
   private onEvent: (e: BufferEvent) => void = () => {};
   private controller: AbortController | null = null;
   private played: PlayedSnippet[] = [];
-  private readonly windowMs: number;
 
-  constructor(stations: Station[], windowMs = 60_000) {
-    this.windowMs = windowMs;
+  /** `stations` must be in the same order as the server's (api/stream.ts
+   * frames each payload with its index into this list). */
+  constructor(
+    private readonly stations: Station[],
+    private readonly windowMs = 60_000
+  ) {
     for (const s of stations) this.perStation.set(s.id, { chunks: [], received: 0, cursor: 0 });
   }
 
   /** Open the one multiplexed connection. Call once at tune-in (and
    * again after stop() if resuming from a hidden tab). */
-  start(stations: Station[]): void {
+  start(): void {
     this.stop();
     const controller = new AbortController();
     this.controller = controller;
-    this.demux(stations, controller.signal);
+    void this.demux(controller.signal);
   }
 
   stop(): void {
@@ -152,16 +150,13 @@ export class StationBuffer {
     this.onEvent = fn;
   }
 
-  /** Per-station receive rate and how much is buffered right now. */
-  stats(stations: Station[]): StationStats[] {
+  /** Per-station receive rate. */
+  stats(): StationStats[] {
     const now = Date.now();
-    return stations.map((station) => {
-      const chunks = this.perStation.get(station.id)?.chunks ?? [];
+    return this.stations.map((station) => {
       let recent = 0;
-      for (const c of chunks) if (now - c.t <= STATS_WINDOW_MS) recent += c.bytes.length;
-      const kbps = (recent * 8) / STATS_WINDOW_MS;
-      const span = chunks.length ? (now - chunks[0].t) / 1000 : 0;
-      return { station, kbps, bufferedSeconds: span };
+      for (const c of this.perStation.get(station.id)!.chunks) if (now - c.t <= STATS_WINDOW_MS) recent += c.bytes.length;
+      return { station, kbps: (recent * 8) / STATS_WINDOW_MS };
     });
   }
 
@@ -254,17 +249,17 @@ export class StationBuffer {
    * [1 byte station index][4 bytes big-endian length][payload], repeating.
    * The server already discards each (re)connection's own burst, so
    * every byte seen here is clean, already-live-aligned content. */
-  private async demux(stations: Station[], signal: AbortSignal): Promise<void> {
+  private async demux(signal: AbortSignal): Promise<void> {
     // The server drops a client that falls too far behind (see
     // MAX_QUEUED_BYTES in api/stream.ts), and the connection can also just
     // drop -- either way, reconnect for as long as we're tuned in.
     while (!signal.aborted) {
-      await this.readStream(stations, signal);
+      await this.readStream(signal);
       if (!signal.aborted) await new Promise((r) => setTimeout(r, STREAM_RECONNECT_DELAY_MS));
     }
   }
 
-  private async readStream(stations: Station[], signal: AbortSignal): Promise<void> {
+  private async readStream(signal: AbortSignal): Promise<void> {
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
       const res = await fetch('/api/stream', { signal });
@@ -281,12 +276,7 @@ export class StationBuffer {
           this.onEvent({ kind: 'disconnected', reason: 'server ended the stream' });
           break;
         }
-        if (value && value.length) {
-          const merged = new Uint8Array(buf.length + value.length);
-          merged.set(buf, 0);
-          merged.set(value, buf.length);
-          buf = merged;
-        }
+        if (value && value.length) buf = concatBytes([buf, value]);
 
         // A read() can deliver a partial frame, several frames at once,
         // or both -- drain every complete frame currently buffered and
@@ -300,7 +290,7 @@ export class StationBuffer {
           const payload = buf.slice(5, 5 + len);
           buf = buf.slice(5 + len);
 
-          const station = stations[stationIndex];
+          const station = this.stations[stationIndex];
           if (!station) continue;
           if (!heard.has(station.id)) {
             heard.add(station.id);

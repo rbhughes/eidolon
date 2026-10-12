@@ -1,8 +1,13 @@
 import type { APIRoute } from 'astro';
-import { env } from 'cloudflare:workers';
 import { getSecret } from 'astro:env/server';
-import { transcribeMp3, translateToEnglish, OpenRouterError, type TranslateResult } from '../../lib/openrouter';
-import { checkRateLimit, rateLimitedResponse } from '../../lib/rateLimit';
+import {
+  transcribeMp3,
+  translateToEnglish,
+  OpenRouterError,
+  type TranscribeDebug,
+  type TranscribeResponse
+} from '../../lib/openrouter';
+import { checkRateLimit, rateLimitedResponse } from '../../lib/rateLimiter';
 
 const MAX_CLIP_BYTES = 2_000_000; // generous cap on a client-assembled clip
 // Translation normally answers in ~1s; one that hangs is going to fail
@@ -51,7 +56,7 @@ export const POST: APIRoute = async ({ request }) => {
     // OpenRouter calls are abandoned rather than run to completion.
     const transcription = await transcribeMp3(apiKey, bytes, undefined, request.signal);
     let text = transcription.text;
-    let translation: TranslateResult | { error: string } | null = null;
+    let translation: TranscribeDebug['translation'] = null;
     if (text.trim()) {
       // A failed translation must not throw away a successful
       // transcription -- the one failure the user hit (16.7s = ~1.7s
@@ -70,7 +75,7 @@ export const POST: APIRoute = async ({ request }) => {
     // models, how long, the exact usage/cost OpenRouter reported, and the
     // full translation prompt. Nothing secret -- the point of the log is
     // to show all of it.
-    const debug = {
+    const debug: TranscribeDebug = {
       clipBytes: file.size,
       transcription: {
         model: transcription.model,
@@ -81,7 +86,7 @@ export const POST: APIRoute = async ({ request }) => {
       },
       translation
     };
-    return Response.json({ ok: true, text, timestamp: new Date().toISOString(), debug });
+    return Response.json({ ok: true, text, timestamp: new Date().toISOString(), debug } satisfies TranscribeResponse);
   } catch (err) {
     const elapsed = Date.now() - started;
     if (request.signal.aborted) {

@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 
+from spiritbox import runtime
+
 REQUIRED_BINARIES = ["rtl_test", "rtl_sdr", "rtl_fm"]
 
 
@@ -55,7 +57,7 @@ def check_capture() -> tuple[bool, str]:
     """Run rtl_fm briefly and confirm it actually produces audio bytes."""
     try:
         proc = subprocess.run(
-            ["rtl_fm", "-f", "100.0M", "-M", "fm", "-s", "200k", "-r", "48k", "-"],
+            runtime.rtl_fm_cmd(runtime.DEFAULT_FREQ),
             capture_output=True,
             timeout=3,
         )

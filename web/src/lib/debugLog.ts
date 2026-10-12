@@ -64,8 +64,4 @@ export class DebugLog {
     while (this.el.childElementCount > MAX_LINES) this.el.firstElementChild!.remove();
     if (this.follow) this.el.scrollTop = this.el.scrollHeight;
   }
-
-  clear(): void {
-    this.el.replaceChildren();
-  }
 }

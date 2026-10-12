@@ -8,6 +8,7 @@ import termios
 import tty
 from datetime import datetime
 from pathlib import Path
+from typing import NoReturn
 
 import typer
 from dotenv import load_dotenv
@@ -19,6 +20,13 @@ load_dotenv(runtime.PROJECT_ROOT / ".env")
 app = typer.Typer(help="A ghost-box style RTL-SDR CLI with speech-to-text.")
 
 RECORDINGS_DIR = runtime.PROJECT_ROOT / "recordings"
+BAND_LOW = "88.0M"
+BAND_HIGH = "108.0M"
+
+
+def _die(message: object) -> NoReturn:
+    typer.echo(f"error: {message}", err=True)
+    raise typer.Exit(1)
 
 
 def _parse_freq(value: str) -> float:
@@ -47,8 +55,7 @@ def start(
     try:
         state = runtime.start(freq, volume)
     except RuntimeError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1)
+        _die(exc)
     typer.echo(f"listening at {state['freq']} (rtl_fm pid={state['rtl_fm_pid']}, player pid={state['player_pid']})")
     typer.echo("run 'spiritbox stop' to stop")
 
@@ -76,15 +83,14 @@ def record(
     try:
         path = runtime.record(out, seconds, freq)
     except RuntimeError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1)
+        _die(exc)
     typer.echo(f"recorded {seconds}s at {freq} -> {path}")
 
 
 @app.command()
 def scan(
-    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the scan range"),
-    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the scan range"),
+    band_low: str = typer.Option(BAND_LOW, "--band-low", help="Low end of the scan range"),
+    band_high: str = typer.Option(BAND_HIGH, "--band-high", help="High end of the scan range"),
 ) -> None:
     """Scan a band for active stations and save them as sweep hotspots.
 
@@ -119,8 +125,8 @@ def sweep(
     chunk_seconds: float = typer.Option(
         1.5, "--chunk-seconds", "-c", help="Seconds of audio per hop (shorter = faster perceived sweep)"
     ),
-    band_low: str = typer.Option("88.0M", "--band-low", help="Low end of the hop range (sdr source only)"),
-    band_high: str = typer.Option("108.0M", "--band-high", help="High end of the hop range (sdr source only)"),
+    band_low: str = typer.Option(BAND_LOW, "--band-low", help="Low end of the hop range (sdr source only)"),
+    band_high: str = typer.Option(BAND_HIGH, "--band-high", help="High end of the hop range (sdr source only)"),
     volume: int = typer.Option(runtime.DEFAULT_VOLUME, "--volume", "-v", help="Linear playback volume"),
     source: str = typer.Option(
         "sdr", "--source", help="Where chunks come from: 'sdr' (RTL-SDR dongle) or 'stream' (internet radio)"
@@ -169,16 +175,12 @@ def sweep(
     Requires an interactive terminal (reads raw keypresses from stdin).
     """
     if not sys.stdin.isatty():
-        typer.echo("error: 'sweep' needs an interactive terminal (stdin is not a tty)", err=True)
-        raise typer.Exit(1)
+        _die("'sweep' needs an interactive terminal (stdin is not a tty)")
 
     band = (_parse_freq(band_low), _parse_freq(band_high))
 
     if source == "sdr" and not runtime.load_hotspots():
         typer.echo("no saved hotspots -- run 'spiritbox scan' first for better odds of real text")
-    if source == "stream" and not runtime.load_streams():
-        typer.echo(f"error: no stations configured -- add some to {runtime.STREAMS_FILE}", err=True)
-        raise typer.Exit(1)
 
     def on_chunk(label: str, index: int) -> None:
         typer.echo(f"\r[{index}] {label:<24}", nl=False)
@@ -206,8 +208,7 @@ def sweep(
             on_profile=on_profile,
         )
     except (RuntimeError, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(1)
+        _die(exc)
 
     typer.echo(f"sweeping -- SPACE marks everything since the last mark (capped at {max_mark_seconds:.0f}s), q quits")
     session.start()
