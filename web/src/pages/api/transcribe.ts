@@ -11,9 +11,10 @@ const TRANSLATE_TIMEOUT_MS = 8_000;
 
 export const POST: APIRoute = async ({ request }) => {
   // Checked first, before touching the body -- this is the endpoint that
-  // actually costs money (OpenRouter calls), so the limit here is the one
-  // doing the real budget protection. See wrangler.jsonc for the bucket.
-  if (!(await checkRateLimit(env.RATE_LIMIT_TRANSCRIBE, request))) {
+  // actually costs money (OpenRouter calls). The hard spending cap is the
+  // OpenRouter key's credit limit; this per-client limit stops one client
+  // from burning through it. See lib/rateLimiter.ts.
+  if (!(await checkRateLimit('transcribe', request))) {
     return rateLimitedResponse({ ok: false, error: 'rate limited, slow down' });
   }
 

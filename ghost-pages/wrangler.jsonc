@@ -1,0 +1,12 @@
+// Pages project for ghost.purr.io -- a thin proxy to the eidolon Worker
+// (../web/wrangler.jsonc). See public/_worker.js for why it exists.
+// Deploy (from this directory): ../web/node_modules/.bin/wrangler pages deploy
+{
+	"$schema": "../web/node_modules/wrangler/config-schema.json",
+	// Must differ from the Worker's name: locally, wrangler resolves the
+	// EIDOLON binding by name, and a shared name can bind this proxy to itself.
+	"name": "ghost-purr",
+	"pages_build_output_dir": "./public",
+	"compatibility_date": "2026-10-06",
+	"services": [{ "binding": "EIDOLON", "service": "eidolon" }]
+}

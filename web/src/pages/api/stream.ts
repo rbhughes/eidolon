@@ -75,7 +75,7 @@ export const GET: APIRoute = async ({ request }) => {
   // One request now instead of nine per tune-in, so if anything this is
   // more generous in practice than before -- still bounded so it can't be
   // used to hammer a station or run up bandwidth from one IP.
-  if (!(await checkRateLimit(env.RATE_LIMIT_STREAM, request))) {
+  if (!(await checkRateLimit('stream', request))) {
     return rateLimitedResponse({ error: 'rate limited, slow down' });
   }
 
