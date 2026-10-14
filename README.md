@@ -1,11 +1,30 @@
 # eidolon / spiritbox
 
-A Python CLI "spiritbox" (ghost-box style) app: sweep/scan radio
-frequencies via an RTL-SDR dongle (or, as a no-hardware alternative, hop
-across internet radio stations), capture audio, and transcribe it
-near-real-time using a cheap model via OpenRouter.
+> **Try it in a browser at [ghost.purr.io](https://ghost.purr.io)** -- no
+> dongle, no install. Nine live internet radio stations, a two-second
+> snippet from each, and two language models deciding what the spirits
+> said. Switch to *skeptic* mode to watch every connection, snippet pick,
+> prompt, token count and cent as it happens.
 
-## Requirements
+A spirit box sweeps radio too quickly for whole words to get through, and
+believers hear the dead in the gaps. This repo builds one twice:
+
+- **`src/spiritbox/`** -- the original, and the reason for the RTL-SDR
+  requirements below: a Python CLI that sweeps/scans real FM frequencies
+  through an SDR dongle (or hops internet radio stations, with no hardware
+  at all), plays what it hears live, and transcribes the parts you mark
+  near-real-time using a cheap model via OpenRouter.
+- **`web/`** -- the demo behind ghost.purr.io: an Astro + Cloudflare Worker
+  port that a stranger can open without owning a radio. Internet radio is
+  not a radio, and [`web/README.md`](web/README.md) is the account of what
+  that cost -- burst-on-connect, the browser's six-connection limit, and
+  MP3 fragments that refuse to decode alone.
+
+Speech-to-text models invent confident words out of noise, which happens to
+be exactly the property a spirit box runs on. Neither version pretends
+otherwise.
+
+## Requirements (CLI)
 
 - RTL-SDR dongle (tested with an RTL-SDR Blog V4) and the `rtl-sdr`
   userspace tools (`rtl_test`, `rtl_sdr`, `rtl_fm`, `rtl_power`) on PATH --
